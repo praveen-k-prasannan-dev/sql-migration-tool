@@ -1,0 +1,38 @@
+namespace SqlMigrationTool.Models;
+
+public class InstallManifest
+{
+    public string              Version               { get; set; } = "1.0";
+    public string              Created               { get; set; } = DateTime.Now.ToString("O");
+    public string              SourceServer          { get; set; } = "";
+    public string              SourceDatabase        { get; set; } = "";
+    public int                 SqlCompatibilityLevel { get; set; } = 160;
+    public List<ManifestPhase> Phases                { get; set; } = new();
+    public ManifestSummary     Summary               { get; set; } = new();
+}
+
+public class ManifestPhase
+{
+    public int                 Phase { get; set; }
+    public string              Name  { get; set; } = "";
+    public List<ManifestEntry> Files { get; set; } = new();
+}
+
+public class ManifestEntry
+{
+    public int    Order  { get; set; }
+    public string Type   { get; set; } = "";
+    public string Object { get; set; } = "";
+    public string File   { get; set; } = "";
+    public int    Rows   { get; set; }
+}
+
+public class ManifestSummary
+{
+    public int TotalTables     { get; set; }
+    public int TotalViews      { get; set; }
+    public int TotalProcedures { get; set; }
+    public int TotalFunctions  { get; set; }
+    public int TotalDataFiles  { get; set; }
+    public int TotalFiles      { get; set; }
+}

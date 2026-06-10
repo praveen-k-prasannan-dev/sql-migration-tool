@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\SqlMigrationTool\Models\*.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\SqlConnectionService.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\SchemaExporter.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\DataExporter.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\BackupService.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\ErrorLogger.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\InstallService.cs" />
+  </ItemGroup>
+</Project>

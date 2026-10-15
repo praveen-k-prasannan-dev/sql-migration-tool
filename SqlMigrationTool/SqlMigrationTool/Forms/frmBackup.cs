@@ -29,18 +29,6 @@ public class frmBackup : Form
     private readonly Dictionary<string, int[]>        _summaryData  = new(); // [total, success, failed]
     private readonly Dictionary<string, ListViewItem> _summaryItems = new();
 
-    private static readonly (string Type, string Label)[] SummaryRows =
-    {
-        ("TABLE",   "Tables"),
-        ("DATA",    "Data Files"),
-        ("VIEW",    "Views"),
-        ("PROC",    "Stored Procs"),
-        ("FUNC",    "Functions"),
-        ("TRIGGER", "Triggers"),
-        ("FK",      "Foreign Keys"),
-        ("INDEX",   "Indexes"),
-    };
-
     public frmBackup(ConnectionConfig cfg)
     {
         _cfg      = cfg;
@@ -128,11 +116,11 @@ public class frmBackup : Form
 
         // Type filter checkboxes
         content.Controls.Add(MakeLabel("Include:", 0, y + 2));
-        chkTables   = MakeTypeChk("Tables",    90,  y, "TABLE");
-        chkViews    = MakeTypeChk("Views",     200, y, "VIEW");
-        chkProcs    = MakeTypeChk("Procs",     290, y, "PROC");
-        chkFuncs    = MakeTypeChk("Functions", 380, y, "FUNC");
-        chkTriggers = MakeTypeChk("Triggers",  490, y, "TRIGGER");
+        chkTables   = MakeTypeChk("Tables",    90,  y, ObjectTypes.Table);
+        chkViews    = MakeTypeChk("Views",     200, y, ObjectTypes.View);
+        chkProcs    = MakeTypeChk("Procs",     290, y, ObjectTypes.Proc);
+        chkFuncs    = MakeTypeChk("Functions", 380, y, ObjectTypes.Func);
+        chkTriggers = MakeTypeChk("Triggers",  490, y, ObjectTypes.Trigger);
         content.Controls.AddRange(new Control[] { chkTables, chkViews, chkProcs, chkFuncs, chkTriggers });
         y += 34;
 
@@ -327,11 +315,11 @@ public class frmBackup : Form
                 int count = _allObjects.Count(o => o.Type == type);
                 chk.Text = type switch
                 {
-                    "TABLE"   => $"Tables ({count})",
-                    "VIEW"    => $"Views ({count})",
-                    "PROC"    => $"Procs ({count})",
-                    "FUNC"    => $"Functions ({count})",
-                    "TRIGGER" => $"Triggers ({count})",
+                    ObjectTypes.Table   => $"Tables ({count})",
+                    ObjectTypes.View    => $"Views ({count})",
+                    ObjectTypes.Proc    => $"Procs ({count})",
+                    ObjectTypes.Func    => $"Functions ({count})",
+                    ObjectTypes.Trigger => $"Triggers ({count})",
                     _         => chk.Text
                 };
             }
@@ -366,20 +354,20 @@ public class frmBackup : Form
         _summaryData.Clear();
         _summaryItems.Clear();
 
-        var hasTable   = selected.Any(o => o.Type == "TABLE");
-        var hasView    = selected.Any(o => o.Type == "VIEW");
-        var hasProc    = selected.Any(o => o.Type == "PROC");
-        var hasFunc    = selected.Any(o => o.Type == "FUNC");
-        var hasTrigger = selected.Any(o => o.Type == "TRIGGER");
+        var hasTable   = selected.Any(o => o.Type == ObjectTypes.Table);
+        var hasView    = selected.Any(o => o.Type == ObjectTypes.View);
+        var hasProc    = selected.Any(o => o.Type == ObjectTypes.Proc);
+        var hasFunc    = selected.Any(o => o.Type == ObjectTypes.Func);
+        var hasTrigger = selected.Any(o => o.Type == ObjectTypes.Trigger);
 
         var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (hasTable)   { show.Add("TABLE"); show.Add("DATA"); show.Add("FK"); show.Add("INDEX"); }
-        if (hasView)    show.Add("VIEW");
-        if (hasProc)    show.Add("PROC");
-        if (hasFunc)    show.Add("FUNC");
-        if (hasTrigger) show.Add("TRIGGER");
+        if (hasTable)   { show.Add(ObjectTypes.Table); show.Add(ObjectTypes.Data); show.Add(ObjectTypes.Fk); show.Add(ObjectTypes.Index); }
+        if (hasView)    show.Add(ObjectTypes.View);
+        if (hasProc)    show.Add(ObjectTypes.Proc);
+        if (hasFunc)    show.Add(ObjectTypes.Func);
+        if (hasTrigger) show.Add(ObjectTypes.Trigger);
 
-        foreach (var (type, label) in SummaryRows)
+        foreach (var (type, label) in ObjectTypes.SummaryRows)
         {
             if (!show.Contains(type)) continue;
 

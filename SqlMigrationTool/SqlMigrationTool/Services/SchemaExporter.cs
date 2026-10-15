@@ -37,7 +37,7 @@ public class SchemaExporter
             WHERE t.TABLE_TYPE = 'BASE TABLE'
             ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "TABLE", r => (long)r.GetInt64(2));
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Table, r => (long)r.GetInt64(2));
     }
 
     private static async Task<List<DatabaseObject>> ListViewsAsync(SqlConnection conn)
@@ -47,7 +47,7 @@ public class SchemaExporter
             FROM INFORMATION_SCHEMA.VIEWS
             ORDER BY TABLE_SCHEMA, TABLE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "VIEW");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.View);
     }
 
     private static async Task<List<DatabaseObject>> ListStoredProcsAsync(SqlConnection conn)
@@ -58,7 +58,7 @@ public class SchemaExporter
             WHERE ROUTINE_TYPE = 'PROCEDURE'
             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "PROC");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Proc);
     }
 
     private static async Task<List<DatabaseObject>> ListFunctionsAsync(SqlConnection conn)
@@ -69,7 +69,7 @@ public class SchemaExporter
             WHERE ROUTINE_TYPE = 'FUNCTION'
             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "FUNC");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Func);
     }
 
     private static async Task<List<DatabaseObject>> ListTriggersAsync(SqlConnection conn)
@@ -80,7 +80,7 @@ public class SchemaExporter
             WHERE is_ms_shipped = 0
             ORDER BY name";
 
-        return await QueryObjectsAsync(conn, sql, "TRIGGER");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Trigger);
     }
 
     private static async Task<List<DatabaseObject>> QueryObjectsAsync(
@@ -159,10 +159,10 @@ public class SchemaExporter
 
         var typeLabel = obj.Type switch
         {
-            "VIEW"    => "V",
-            "PROC"    => "P",
-            "FUNC"    => "FN",
-            "TRIGGER" => "TR",
+            ObjectTypes.View    => "V",
+            ObjectTypes.Proc    => "P",
+            ObjectTypes.Func    => "FN",
+            ObjectTypes.Trigger => "TR",
             _         => "U"
         };
 
@@ -172,10 +172,10 @@ public class SchemaExporter
 
         var dropType = obj.Type switch
         {
-            "VIEW"    => "VIEW",
-            "PROC"    => "PROCEDURE",
-            "FUNC"    => "FUNCTION",
-            "TRIGGER" => "TRIGGER",
+            ObjectTypes.View    => "VIEW",
+            ObjectTypes.Proc    => "PROCEDURE",
+            ObjectTypes.Func    => "FUNCTION",
+            ObjectTypes.Trigger => "TRIGGER",
             _         => "OBJECT"
         };
         sb.AppendLine($"    DROP {dropType} [{obj.Schema}].[{obj.Name}]");

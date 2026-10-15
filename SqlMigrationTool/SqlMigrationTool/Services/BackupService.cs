@@ -40,18 +40,18 @@ public class BackupService
         progress.Report(new BackupProgress("=== Phase 1: Schema ==="));
         var phase1 = new ManifestPhase { Phase = 1, Name = "Schema (Tables, Views, Functions, Stored Procedures)" };
 
-        var tables   = selectedObjects.Where(o => o.Type == "TABLE").ToList();
-        var views    = selectedObjects.Where(o => o.Type == "VIEW").ToList();
-        var funcs    = selectedObjects.Where(o => o.Type == "FUNC").ToList();
-        var procs    = selectedObjects.Where(o => o.Type == "PROC").ToList();
-        var triggers = selectedObjects.Where(o => o.Type == "TRIGGER").ToList();
+        var tables   = selectedObjects.Where(o => o.Type == ObjectTypes.Table).ToList();
+        var views    = selectedObjects.Where(o => o.Type == ObjectTypes.View).ToList();
+        var funcs    = selectedObjects.Where(o => o.Type == ObjectTypes.Func).ToList();
+        var procs    = selectedObjects.Where(o => o.Type == ObjectTypes.Proc).ToList();
+        var triggers = selectedObjects.Where(o => o.Type == ObjectTypes.Trigger).ToList();
 
         var schemaSteps = new SchemaStep[]
         {
-            new("TABLE", "tables",            _schema.ScriptTableAsync),
-            new("VIEW",  "views",             _schema.ScriptViewAsync),
-            new("FUNC",  "functions",         _schema.ScriptFuncAsync),
-            new("PROC",  "stored_procedures", _schema.ScriptProcAsync),
+            new(ObjectTypes.Table, "tables",            _schema.ScriptTableAsync),
+            new(ObjectTypes.View,  "views",             _schema.ScriptViewAsync),
+            new(ObjectTypes.Func,  "functions",         _schema.ScriptFuncAsync),
+            new(ObjectTypes.Proc,  "stored_procedures", _schema.ScriptProcAsync),
         };
 
         foreach (var step in schemaSteps)
@@ -96,7 +96,7 @@ public class BackupService
 
             if (obj.RowCount == 0)
             {
-                progress.Report(new BackupProgress($"  - DATA {obj.FullName} (0 rows, skipped)", "DATA", true));
+                progress.Report(new BackupProgress($"  - DATA {obj.FullName} (0 rows, skipped)", ObjectTypes.Data, true));
                 continue;
             }
 
@@ -114,18 +114,18 @@ public class BackupService
                     phase2.Files.Add(new ManifestEntry
                     {
                         Order  = orderCounter++,
-                        Type   = "DATA",
+                        Type   = ObjectTypes.Data,
                         Object = obj.FullName,
                         File   = $"02_data/{SanitiseName(obj.FullName)}/{fileName}",
                         Rows   = rowCount
                     });
                 }
 
-                progress.Report(new BackupProgress($"✔ DATA {obj.FullName} ({chunks.Count} chunks)", "DATA", true));
+                progress.Report(new BackupProgress($"✔ DATA {obj.FullName} ({chunks.Count} chunks)", ObjectTypes.Data, true));
             }
             catch (Exception ex)
             {
-                progress.Report(new BackupProgress($"✘ DATA {obj.FullName}: {ex.Message}", "DATA", false));
+                progress.Report(new BackupProgress($"✘ DATA {obj.FullName}: {ex.Message}", ObjectTypes.Data, false));
             }
         }
 
@@ -146,15 +146,15 @@ public class BackupService
             phase3.Files.Add(new ManifestEntry
             {
                 Order  = orderCounter++,
-                Type   = "FK",
+                Type   = ObjectTypes.Fk,
                 Object = "Foreign Keys",
                 File   = "03_relations/001_foreign_keys.sql"
             });
-            progress.Report(new BackupProgress("✔ Foreign keys scripted", "FK", true));
+            progress.Report(new BackupProgress("✔ Foreign keys scripted", ObjectTypes.Fk, true));
         }
         catch (Exception ex)
         {
-            progress.Report(new BackupProgress($"✘ Foreign keys: {ex.Message}", "FK", false));
+            progress.Report(new BackupProgress($"✘ Foreign keys: {ex.Message}", ObjectTypes.Fk, false));
         }
 
         // Indexes
@@ -166,15 +166,15 @@ public class BackupService
             phase3.Files.Add(new ManifestEntry
             {
                 Order  = orderCounter++,
-                Type   = "INDEX",
+                Type   = ObjectTypes.Index,
                 Object = "Indexes",
                 File   = "03_relations/002_indexes.sql"
             });
-            progress.Report(new BackupProgress("✔ Indexes scripted", "INDEX", true));
+            progress.Report(new BackupProgress("✔ Indexes scripted", ObjectTypes.Index, true));
         }
         catch (Exception ex)
         {
-            progress.Report(new BackupProgress($"✘ Indexes: {ex.Message}", "INDEX", false));
+            progress.Report(new BackupProgress($"✘ Indexes: {ex.Message}", ObjectTypes.Index, false));
         }
 
         // Triggers
@@ -196,15 +196,15 @@ public class BackupService
                 phase3.Files.Add(new ManifestEntry
                 {
                     Order  = orderCounter++,
-                    Type   = "TRIGGER",
+                    Type   = ObjectTypes.Trigger,
                     Object = "Triggers",
                     File   = "03_relations/003_triggers.sql"
                 });
-                progress.Report(new BackupProgress($"✔ {triggers.Count} trigger(s) scripted", "TRIGGER", true));
+                progress.Report(new BackupProgress($"✔ {triggers.Count} trigger(s) scripted", ObjectTypes.Trigger, true));
             }
             catch (Exception ex)
             {
-                progress.Report(new BackupProgress($"✘ Triggers: {ex.Message}", "TRIGGER", false));
+                progress.Report(new BackupProgress($"✘ Triggers: {ex.Message}", ObjectTypes.Trigger, false));
             }
         }
 

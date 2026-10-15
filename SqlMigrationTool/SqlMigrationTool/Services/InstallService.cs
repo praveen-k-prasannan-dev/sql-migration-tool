@@ -35,7 +35,7 @@ public class InstallService
                     var fullPath = Path.Combine(folder,
                         entry.File.Replace('/', Path.DirectorySeparatorChar));
 
-                    if (entry.Type == "DATA")
+                    if (entry.Type == ObjectTypes.Data)
                         await InsertDataFileAsync(fullPath, ct);
                     else
                         await ExecuteSqlFileAsync(fullPath, ct);

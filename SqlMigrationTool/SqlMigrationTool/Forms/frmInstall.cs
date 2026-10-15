@@ -28,19 +28,6 @@ public class frmInstall : Form
     private readonly Dictionary<string, int[]>               _summaryData  = new(); // [total, success, failed]
     private readonly Dictionary<string, ListViewItem>        _summaryItems = new();
 
-    // Fixed display order and labels for summary rows
-    private static readonly (string Type, string Label)[] SummaryRows =
-    {
-        ("TABLE",   "Tables"),
-        ("DATA",    "Data Files"),
-        ("VIEW",    "Views"),
-        ("PROC",    "Stored Procs"),
-        ("FUNC",    "Functions"),
-        ("TRIGGER", "Triggers"),
-        ("FK",      "Foreign Keys"),
-        ("INDEX",   "Indexes"),
-    };
-
     public frmInstall(ConnectionConfig cfg)
     {
         _cfg = cfg;
@@ -405,7 +392,7 @@ public class frmInstall : Form
         _summaryData.Clear();
         _summaryItems.Clear();
 
-        foreach (var (type, label) in SummaryRows)
+        foreach (var (type, label) in ObjectTypes.SummaryRows)
         {
             if (!typeCounts.TryGetValue(type, out var total)) continue;
 

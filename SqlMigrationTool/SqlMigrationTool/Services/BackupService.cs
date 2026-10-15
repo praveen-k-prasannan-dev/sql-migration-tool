@@ -46,111 +46,41 @@ public class BackupService
         var procs    = selectedObjects.Where(o => o.Type == "PROC").ToList();
         var triggers = selectedObjects.Where(o => o.Type == "TRIGGER").ToList();
 
-        // Tables
-        var tablesDir = Path.Combine(outputFolder, "01_schema", "tables");
-        Directory.CreateDirectory(tablesDir);
-        foreach (var obj in tables)
+        var schemaSteps = new SchemaStep[]
         {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting TABLE {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptTableAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(tablesDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
-                {
-                    Order  = orderCounter++,
-                    Type   = "TABLE",
-                    Object = obj.FullName,
-                    File   = $"01_schema/tables/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ TABLE {obj.FullName}", "TABLE", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ TABLE {obj.FullName}: {ex.Message}", "TABLE", false));
-            }
-        }
+            new("TABLE", "tables",            _schema.ScriptTableAsync),
+            new("VIEW",  "views",             _schema.ScriptViewAsync),
+            new("FUNC",  "functions",         _schema.ScriptFuncAsync),
+            new("PROC",  "stored_procedures", _schema.ScriptProcAsync),
+        };
 
-        // Views
-        var viewsDir = Path.Combine(outputFolder, "01_schema", "views");
-        Directory.CreateDirectory(viewsDir);
-        foreach (var obj in views)
+        foreach (var step in schemaSteps)
         {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting VIEW {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptViewAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(viewsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
-                {
-                    Order  = orderCounter++,
-                    Type   = "VIEW",
-                    Object = obj.FullName,
-                    File   = $"01_schema/views/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ VIEW {obj.FullName}", "VIEW", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ VIEW {obj.FullName}: {ex.Message}", "VIEW", false));
-            }
-        }
+            var stepDir = Path.Combine(outputFolder, "01_schema", step.Folder);
+            Directory.CreateDirectory(stepDir);
 
-        // Functions
-        var funcsDir = Path.Combine(outputFolder, "01_schema", "functions");
-        Directory.CreateDirectory(funcsDir);
-        foreach (var obj in funcs)
-        {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting FUNC {obj.FullName}"));
-            try
+            foreach (var obj in selectedObjects.Where(o => o.Type == step.Type))
             {
-                var script   = await _schema.ScriptFuncAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(funcsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
+                ct.ThrowIfCancellationRequested();
+                progress.Report(new BackupProgress($"> Scripting {step.Type} {obj.FullName}"));
+                try
                 {
-                    Order  = orderCounter++,
-                    Type   = "FUNC",
-                    Object = obj.FullName,
-                    File   = $"01_schema/functions/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ FUNC {obj.FullName}", "FUNC", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ FUNC {obj.FullName}: {ex.Message}", "FUNC", false));
-            }
-        }
-
-        // Stored Procedures
-        var procsDir = Path.Combine(outputFolder, "01_schema", "stored_procedures");
-        Directory.CreateDirectory(procsDir);
-        foreach (var obj in procs)
-        {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting PROC {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptProcAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(procsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
+                    var script   = await step.Script(obj);
+                    var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
+                    await File.WriteAllTextAsync(Path.Combine(stepDir, fileName), script, ct);
+                    phase1.Files.Add(new ManifestEntry
+                    {
+                        Order  = orderCounter++,
+                        Type   = step.Type,
+                        Object = obj.FullName,
+                        File   = $"01_schema/{step.Folder}/{fileName}"
+                    });
+                    progress.Report(new BackupProgress($"✔ {step.Type} {obj.FullName}", step.Type, true));
+                }
+                catch (Exception ex)
                 {
-                    Order  = orderCounter++,
-                    Type   = "PROC",
-                    Object = obj.FullName,
-                    File   = $"01_schema/stored_procedures/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ PROC {obj.FullName}", "PROC", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ PROC {obj.FullName}: {ex.Message}", "PROC", false));
+                    progress.Report(new BackupProgress($"✘ {step.Type} {obj.FullName}: {ex.Message}", step.Type, false));
+                }
             }
         }
 
@@ -297,6 +227,8 @@ public class BackupService
         progress.Report(new BackupProgress($"✔ Backup complete. {manifest.Summary.TotalFiles} files written."));
         progress.Report(new BackupProgress($"  Manifest: {manifestPath}"));
     }
+
+    private sealed record SchemaStep(string Type, string Folder, Func<DatabaseObject, Task<string>> Script);
 
     private static string SanitiseName(string name)
         => name.Replace('.', '_').Replace('[', '_').Replace(']', '_')

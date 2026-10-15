@@ -78,6 +78,7 @@ public class SchemaExporter
             SELECT OBJECT_SCHEMA_NAME(parent_id), name, 0
             FROM sys.triggers
             WHERE is_ms_shipped = 0
+              AND parent_class = 1   -- table/view triggers only; database triggers have no schema
             ORDER BY name";
 
         return await QueryObjectsAsync(conn, sql, ObjectTypes.Trigger);

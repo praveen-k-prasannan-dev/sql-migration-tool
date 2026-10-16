@@ -27,10 +27,10 @@ public class BackupService
         int                       chunkSize,
         IProgress<BackupProgress> progress,
         CancellationToken         ct,
-        ScriptMode                mode = ScriptMode.DropAndCreate,
-        bool                      writeCleanupScript = false)
+        BackupOptions?            options = null)
     {
-        _mode = mode;
+        options ??= new BackupOptions();
+        _mode = options.Mode;
         Directory.CreateDirectory(outputFolder);
 
         var manifest = new InstallManifest
@@ -40,7 +40,7 @@ public class BackupService
             SourceDatabase        = _cfg.Database,
             SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync(),
             DatabaseCollation     = await _schema.GetDatabaseCollationAsync(),
-            ScriptMode            = mode.ToString()
+            ScriptMode            = _mode.ToString()
         };
 
         _order = 1;
@@ -172,16 +172,21 @@ public class BackupService
         progress.Report(new BackupProgress("=== Phase 3: Relations ==="));
         var phase3 = new ManifestPhase { Phase = 3, Name = "Relations, Indexes, Triggers" };
 
-        await RunScriptStepsAsync(phase3, outputFolder, "03_relations", new ScriptStep[]
+        var phase3Steps = new List<ScriptStep>
         {
             new(ObjectTypes.Fk,       "foreign_keys",     "Foreign keys",       async () => await _schema.ScriptForeignKeysAsync()),
             new(ObjectTypes.Index,    "indexes",          "Indexes",            async () => await _schema.ScriptIndexesAsync()),
             new(ObjectTypes.Trigger,  "triggers",         "Triggers",           () => ScriptTriggersAsync(triggers, progress, ct)),
             new(ObjectTypes.Sequence, "sequence_restart", "Sequence positions", _schema.ScriptSequenceRestartsAsync),
             new(ObjectTypes.ExtendedProperty, "extended_properties", "Extended properties", _schema.ScriptExtendedPropertiesAsync),
-            // Last: DDL triggers fire on (and can block) any schema change made after them.
-            new(ObjectTypes.DbTrigger, "database_triggers", "Database triggers", _schema.ScriptDatabaseTriggersAsync),
-        }, progress, ct);
+        };
+        // Opt-in: logins differ per server. After every object exists, so permissions can be granted.
+        if (options.IncludeSecurity)
+            phase3Steps.Add(new(ObjectTypes.Security, "security", "Users, roles and permissions", _schema.ScriptSecurityAsync));
+        // Last: DDL triggers fire on (and can block) any schema change made after them.
+        phase3Steps.Add(new(ObjectTypes.DbTrigger, "database_triggers", "Database triggers", _schema.ScriptDatabaseTriggersAsync));
+
+        await RunScriptStepsAsync(phase3, outputFolder, "03_relations", phase3Steps, progress, ct);
 
         manifest.Phases.Add(phase3);
 
@@ -200,7 +205,7 @@ public class BackupService
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, _jsonOptions), ct);
 
         // Optional drop-everything script for a target; never part of the install.
-        if (writeCleanupScript)
+        if (options.WriteCleanupScript)
         {
             var cleanup = await CleanupScriptBuilder.BuildAsync(_cfg, tables, orderedProgrammable, triggers);
             await File.WriteAllTextAsync(Path.Combine(outputFolder, CleanupScriptBuilder.FileName), cleanup, ct);

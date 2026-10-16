@@ -18,6 +18,7 @@ public class frmBackup : Form
     private NumericUpDown   nudChunkSize    = null!;
     private ComboBox        cmbScriptMode   = null!;
     private CheckBox        chkCleanupScript = null!;
+    private CheckBox        chkSecurity     = null!;
     private ListBox         lstLog          = null!;
     private ListView        lstSummary      = null!;
     private Label           lblStatus       = null!;
@@ -124,6 +125,15 @@ public class frmBackup : Form
         chkFuncs    = MakeTypeChk("Functions", 380, y, ObjectTypes.Func);
         chkTriggers = MakeTypeChk("Triggers",  490, y, ObjectTypes.Trigger);
         content.Controls.AddRange(new Control[] { chkTables, chkViews, chkProcs, chkFuncs, chkTriggers });
+
+        // Opt-in: database users, roles and permissions (logins differ per server).
+        chkSecurity = new CheckBox
+        {
+            Text     = "Users, roles & permissions",
+            Location = new Point(620, y),
+            AutoSize = true
+        };
+        content.Controls.Add(chkSecurity);
         y += 34;
 
         // Object list
@@ -476,7 +486,12 @@ public class frmBackup : Form
         {
             var svc = new BackupService(_cfg);
             var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
-            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token, mode, chkCleanupScript.Checked);
+            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token, new BackupOptions
+            {
+                Mode               = mode,
+                WriteCleanupScript = chkCleanupScript.Checked,
+                IncludeSecurity    = chkSecurity.Checked
+            });
 
             MessageBox.Show(
                 $"Backup complete!\n\nOutput folder:\n{folder}",

@@ -322,6 +322,15 @@ CREATE USER MigrationTestUser WITHOUT LOGIN;
 GO
 ALTER ROLE SalesReader ADD MEMBER MigrationTestUser;
 GO
+CREATE USER ReportUser WITHOUT LOGIN WITH DEFAULT_SCHEMA = Sales;
+GO
+ALTER ROLE db_datareader ADD MEMBER ReportUser;                         -- fixed role membership
+GO
+GRANT EXECUTE ON TYPE::dbo.OrderLineTVP TO SalesReader;                 -- type permission
+GRANT SELECT ON dbo.Customer (Name) TO SalesReader WITH GRANT OPTION;   -- column-level, grant option
+DENY DELETE ON dbo.Customer TO MigrationTestUser;                       -- deny
+GRANT EXECUTE ON dbo.uspSaveOrderLines TO public;                       -- explicit grant to public
+GO
 
 -- ── Data ─────────────────────────────────────────────────────────────────────
 INSERT dbo.Customer (Code, Name, Phone, Email, CreatedAt) VALUES

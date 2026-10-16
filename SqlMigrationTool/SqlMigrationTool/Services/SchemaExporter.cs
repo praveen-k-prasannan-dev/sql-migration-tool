@@ -720,6 +720,145 @@ public class SchemaExporter
             : "";
     }
 
+    /// <summary>
+    /// Database roles, users, role memberships and permissions, or null when there
+    /// are none. Users mapped to a login are mapped to the same-named login on the
+    /// target when it exists, otherwise created WITHOUT LOGIN with a warning so
+    /// their permissions still apply and they can be mapped later. Principals that
+    /// cannot be recreated portably (certificate/key-mapped, external, application
+    /// roles) are skipped with a warning. Every statement is its own batch.
+    /// </summary>
+    public async Task<string?> ScriptSecurityAsync()
+    {
+        const string sql = @"
+            SELECT p.name, p.type, p.default_schema_name, SUSER_SNAME(p.sid), p.authentication_type
+            FROM sys.database_principals p
+            WHERE p.principal_id > 4 AND p.is_fixed_role = 0 AND p.name NOT LIKE N'##%'
+            ORDER BY CASE WHEN p.type = 'R' THEN 0 ELSE 1 END, p.name;
+
+            SELECT USER_NAME(rm.role_principal_id), USER_NAME(rm.member_principal_id)
+            FROM sys.database_role_members rm
+            JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
+            WHERE rm.member_principal_id > 4 AND m.name NOT LIKE N'##%'
+            ORDER BY 1, 2;
+
+            SELECT p.class, p.permission_name, p.state, USER_NAME(p.grantee_principal_id),
+                   CASE p.class
+                       WHEN 1  THEN N'OBJECT::' + QUOTENAME(OBJECT_SCHEMA_NAME(p.major_id)) + N'.' + QUOTENAME(OBJECT_NAME(p.major_id))
+                       WHEN 3  THEN N'SCHEMA::' + QUOTENAME(SCHEMA_NAME(p.major_id))
+                       WHEN 4  THEN (SELECT CASE WHEN dp.type IN ('R', 'A') THEN N'ROLE::' ELSE N'USER::' END + QUOTENAME(dp.name)
+                                     FROM sys.database_principals dp WHERE dp.principal_id = p.major_id)
+                       WHEN 6  THEN (SELECT N'TYPE::' + QUOTENAME(SCHEMA_NAME(t.schema_id)) + N'.' + QUOTENAME(t.name)
+                                     FROM sys.types t WHERE t.user_type_id = p.major_id)
+                       WHEN 10 THEN (SELECT N'XML SCHEMA COLLECTION::' + QUOTENAME(SCHEMA_NAME(x.schema_id)) + N'.' + QUOTENAME(x.name)
+                                     FROM sys.xml_schema_collections x WHERE x.xml_collection_id = p.major_id)
+                   END,
+                   CASE WHEN p.class = 1 AND p.minor_id > 0 THEN COL_NAME(p.major_id, p.minor_id) END
+            FROM sys.database_permissions p
+            JOIN sys.database_principals g ON g.principal_id = p.grantee_principal_id
+            WHERE ((p.grantee_principal_id > 4 AND g.name NOT LIKE N'##%' AND g.is_fixed_role = 0)
+                   OR (p.grantee_principal_id = 0 AND p.class <> 0))   -- explicit grants to public, not its built-in database permissions
+              -- user securables only: public holds built-in grants on every system view
+              AND NOT (p.class = 1 AND OBJECTPROPERTY(p.major_id, 'IsMSShipped') = 1)
+              AND NOT (p.class = 3 AND p.major_id IN (SCHEMA_ID(N'sys'), SCHEMA_ID(N'INFORMATION_SCHEMA')))
+            ORDER BY 4, 1, 5, 6, 2;";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        void Stmt(string s) { sb.AppendLine(s); sb.AppendLine("GO"); }
+        void Warn(string message, params string[] args) =>
+            Stmt($"RAISERROR ({SqlNames.Literal(message)}, 10, 1{string.Concat(args.Select(a => ", " + SqlNames.Literal(a)))}) WITH NOWAIT;");
+
+        sb.AppendLine("-- Security: roles, users, role memberships, permissions");
+        sb.AppendLine();
+        int count = 0;
+
+        while (await rdr.ReadAsync())
+        {
+            count++;
+            var name     = rdr.GetString(0);
+            var type     = rdr.GetString(1).Trim();
+            var schema   = rdr.IsDBNull(2) ? null : rdr.GetString(2);
+            var login    = rdr.IsDBNull(3) ? null : rdr.GetString(3);
+            var auth     = rdr.GetInt32(4);   // 0 none, 1 instance (login), 2 database (contained), 3 windows
+            var q        = SqlNames.Quote(name);
+            var lit      = SqlNames.Literal(name);
+            var withSchema = schema != null && type is "S" or "U" or "G" ? $" WITH DEFAULT_SCHEMA = {SqlNames.Quote(schema)}" : "";
+
+            switch (type)
+            {
+                case "R":
+                    Stmt($"IF DATABASE_PRINCIPAL_ID({lit}) IS NULL CREATE ROLE {q};");
+                    break;
+
+                case "S" or "U" or "G" when auth is 1 or 3 && login != null:
+                    sb.AppendLine($"IF DATABASE_PRINCIPAL_ID({lit}) IS NULL");
+                    sb.AppendLine("BEGIN");
+                    sb.AppendLine($"    IF SUSER_ID({SqlNames.Literal(login)}) IS NOT NULL");
+                    sb.AppendLine($"        CREATE USER {q} FOR LOGIN {SqlNames.Quote(login)}{withSchema};");
+                    sb.AppendLine("    ELSE");
+                    sb.AppendLine("    BEGIN");
+                    sb.AppendLine($"        CREATE USER {q} WITHOUT LOGIN{(schema != null ? $" WITH DEFAULT_SCHEMA = {SqlNames.Quote(schema)}" : "")};");
+                    sb.AppendLine($"        RAISERROR (N'User %s: login %s does not exist on this server, so the user was created WITHOUT LOGIN. Map it later with: ALTER USER %s WITH LOGIN = %s', 10, 1, {lit}, {SqlNames.Literal(login)}, {SqlNames.Literal(q)}, {SqlNames.Literal(SqlNames.Quote(login))}) WITH NOWAIT;");
+                    sb.AppendLine("    END");
+                    sb.AppendLine("END");
+                    sb.AppendLine("GO");
+                    break;
+
+                case "S" when auth == 0:
+                    Stmt($"IF DATABASE_PRINCIPAL_ID({lit}) IS NULL CREATE USER {q} WITHOUT LOGIN{withSchema};");
+                    break;
+
+                case "S" or "U" or "G" when auth == 2:
+                    Stmt($"IF DATABASE_PRINCIPAL_ID({lit}) IS NULL CREATE USER {q} WITHOUT LOGIN{withSchema};");
+                    Warn("User %s is a contained database user; its password cannot be exported, so it was created WITHOUT LOGIN.", name);
+                    break;
+
+                default:
+                    Warn("Principal %s (type %s) cannot be recreated by this tool and was skipped.", name, type);
+                    break;
+            }
+        }
+
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            count++;
+            var (role, member) = (rdr.GetString(0), rdr.GetString(1));
+            Stmt($"IF NOT EXISTS (SELECT 1 FROM sys.database_role_members WHERE role_principal_id = DATABASE_PRINCIPAL_ID({SqlNames.Literal(role)})" +
+                 $" AND member_principal_id = DATABASE_PRINCIPAL_ID({SqlNames.Literal(member)}))" +
+                 $" EXEC sp_addrolemember {SqlNames.Literal(role)}, {SqlNames.Literal(member)};");
+        }
+
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            var cls     = Convert.ToInt32(rdr.GetValue(0));
+            var perm    = rdr.GetString(1);
+            var state   = rdr.GetString(2).Trim();
+            var grantee = SqlNames.Quote(rdr.GetString(3));
+            var target  = rdr.IsDBNull(4) ? null : rdr.GetString(4);
+            var column  = rdr.IsDBNull(5) ? null : rdr.GetString(5);
+
+            if (cls != 0 && target is null)
+            {
+                sb.AppendLine($"-- skipped: {perm} on securable class {cls} to {grantee} (not supported by this tool)");
+                continue;
+            }
+
+            count++;
+            var on     = cls == 0 ? "" : $" ON {target}{(column != null ? $" ({SqlNames.Quote(column)})" : "")}";
+            var action = state == "D" ? "DENY" : "GRANT";
+            var option = state == "W" ? " WITH GRANT OPTION" : "";
+            Stmt($"{action} {perm}{on} TO {grantee}{option};");
+        }
+
+        return count == 0 ? null : sb.ToString();
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"

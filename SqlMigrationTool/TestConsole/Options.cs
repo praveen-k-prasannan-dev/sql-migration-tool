@@ -19,6 +19,7 @@ public sealed class Options
     public bool    Cleanup    { get; private set; }
     public bool    Preview    { get; private set; }
     public bool    ApplyCompat { get; private set; }
+    public bool    Security   { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
@@ -61,6 +62,7 @@ public sealed class Options
                 case "--cleanup":    o.Cleanup    = true; break;
                 case "--preview":    o.Preview    = true; break;
                 case "--apply-compat": o.ApplyCompat = true; break;
+                case "--security":   o.Security   = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
@@ -98,6 +100,7 @@ public sealed class Options
               --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
               --reinstall          roundtrip: install a second time over the populated target
               --cleanup            roundtrip: also write the cleanup (drop-all) script
+              --security           roundtrip: include users, roles and permissions
               --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
               --data-mode <m>      SkipIfNotEmpty (default) | TruncateAndLoad | Append | Upsert
               --verbose            Show every backup/install progress line

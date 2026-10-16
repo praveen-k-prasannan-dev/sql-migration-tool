@@ -36,7 +36,8 @@ public static class Commands
             if (p.Success == false) { backupFailures++; Out.Error("  " + p.Message); }
             else if (o.Verbose)     Out.Info("  " + p.Message);
         });
-        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None, o.Mode, o.Cleanup);
+        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None,
+            new BackupOptions { Mode = o.Mode, WriteCleanupScript = o.Cleanup, IncludeSecurity = o.Security });
         Out.Info($"  Script mode: {o.Mode}");
         Out.Info($"  Backup folder: {folder}");
 
@@ -124,7 +125,8 @@ public static class Commands
         var quiet   = new SyncProgress<BackupProgress>(_ => { });
 
         foreach (var mode in modes)
-            await new BackupService(source).RunAsync(Path.Combine(root, mode.ToString()), objects, o.ChunkSize, quiet, CancellationToken.None, mode);
+            await new BackupService(source).RunAsync(Path.Combine(root, mode.ToString()), objects, o.ChunkSize, quiet, CancellationToken.None,
+                new BackupOptions { Mode = mode, IncludeSecurity = true });
 
         int checkedFiles = 0, failures = 0;
         foreach (var from in modes)

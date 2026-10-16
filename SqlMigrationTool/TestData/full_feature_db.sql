@@ -127,6 +127,9 @@ CREATE TABLE dbo.HeapLog
     Payload   VARBINARY(MAX)   NULL,
     RowGuid   UNIQUEIDENTIFIER ROWGUIDCOL NOT NULL CONSTRAINT DF_HeapLog_RowGuid DEFAULT (NEWID()),
     SparseCol INT SPARSE NULL,
+    Precise   DATETIME2(7)     NULL,
+    Amount    DECIMAL(19,4)    NULL,
+    Ratio     FLOAT            NULL,
     CONSTRAINT CK_HeapLog_Sparse CHECK (SparseCol > 0)
 );
 GO
@@ -289,10 +292,10 @@ EXEC dbo.uspSaveOrderLines @OrderId = 1, @Lines = @lines;
 GO
 INSERT Sales.OrderLine (OrderId, [LineNo], ProductId, Qty, Price) VALUES (999, 1, 12, 1, 1.00); -- orphan row allowed by NOCHECK FK
 GO
-INSERT dbo.HeapLog (Msg, Payload, SparseCol) VALUES
-    (N'first',  0x0102030405, NULL),
-    (N'second', NULL,         42),
-    (N'second', NULL,         42);  -- exact duplicate (heap)
+INSERT dbo.HeapLog (Msg, Payload, SparseCol, Precise, Amount, Ratio) VALUES
+    (N'first',  0x0102030405, NULL, '2025-06-01T12:34:56.1234567', 12345678901234.5678, 0.1),
+    (N'second', NULL,         42,   NULL,                          0.0001,              1.0E-300),
+    (N'second', NULL,         42,   NULL,                          0.0001,              1.0E-300);  -- exact duplicate (heap)
 GO
 INSERT Audit.Archive (ArchiveId, [Year], Info) VALUES (1, 2023, N'old'), (2, 2024, N'mid'), (3, 2025, N'new');
 GO

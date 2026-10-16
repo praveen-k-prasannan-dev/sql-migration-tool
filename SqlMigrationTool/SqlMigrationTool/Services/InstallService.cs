@@ -110,7 +110,11 @@ public class InstallService
 
             await using var cmd = new SqlCommand(insertSql, conn, tran);
             for (int i = 0; i < chunk.Columns.Count; i++)
-                cmd.Parameters.Add(new SqlParameter($"@p{i}", DBNull.Value));
+            {
+                var p = new SqlParameter($"@p{i}", DBNull.Value);
+                ConfigureParameterType(p, i < colTypes.Count ? colTypes[i] : null);
+                cmd.Parameters.Add(p);
+            }
 
             foreach (var row in chunk.Rows)
             {
@@ -178,6 +182,38 @@ public class InstallService
         return columns.Select(c => typeMap.TryGetValue(c, out var t) ? t : (string?)null).ToList();
     }
 
+    /// <summary>
+    /// Fixes the parameter type where inferring it from the .NET value loses data:
+    /// a DateTime would be sent as legacy DATETIME (~3 ms precision, rounding
+    /// datetime2 values), and an untyped NULL as nvarchar, which SQL Server will
+    /// not convert implicitly to a binary column.
+    /// </summary>
+    private static void ConfigureParameterType(SqlParameter p, string? sqlType)
+    {
+        switch (sqlType)
+        {
+            case "DATETIME2":
+                p.SqlDbType = System.Data.SqlDbType.DateTime2;
+                p.Scale     = 7;
+                break;
+            case "DATE":
+                p.SqlDbType = System.Data.SqlDbType.Date;
+                break;
+            case "TIME":
+                p.SqlDbType = System.Data.SqlDbType.Time;
+                p.Scale     = 7;
+                break;
+            case "DATETIMEOFFSET":
+                p.SqlDbType = System.Data.SqlDbType.DateTimeOffset;
+                p.Scale     = 7;
+                break;
+            case "BINARY" or "VARBINARY" or "IMAGE":
+                p.SqlDbType = System.Data.SqlDbType.VarBinary;
+                p.Size      = -1;
+                break;
+        }
+    }
+
     private static object? ConvertJsonElement(JsonElement el, string? sqlType = null)
     {
         return el.ValueKind switch
@@ -185,9 +221,12 @@ public class InstallService
             JsonValueKind.Null    => null,
             JsonValueKind.True    => true,
             JsonValueKind.False   => false,
-            JsonValueKind.Number  => el.TryGetInt64(out var l)  ? l
-                                   : el.TryGetDouble(out var d) ? d
-                                   : (object?)el.GetDecimal(),
+            // Prefer decimal over double so DECIMAL/NUMERIC/MONEY keep every digit;
+            // only FLOAT/REAL columns (and values too large for decimal) use double.
+            JsonValueKind.Number  => el.TryGetInt64(out var l)                    ? l
+                                   : sqlType is "FLOAT" or "REAL"                 ? el.GetDouble()
+                                   : el.TryGetDecimal(out var m)                  ? m
+                                   : (object?)el.GetDouble(),
             JsonValueKind.String  => ConvertStringValue(el.GetString(), sqlType),
             _                     => el.ToString()
         };

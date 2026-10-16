@@ -29,13 +29,12 @@ public class SchemaExporter
     private static async Task<List<DatabaseObject>> ListTablesAsync(SqlConnection conn)
     {
         const string sql = @"
-            SELECT t.TABLE_SCHEMA, t.TABLE_NAME, ISNULL(p.rows, 0) AS [RowCount]
-            FROM INFORMATION_SCHEMA.TABLES t
-            LEFT JOIN sys.partitions p
-                ON p.object_id = OBJECT_ID(t.TABLE_SCHEMA + '.' + t.TABLE_NAME)
-               AND p.index_id IN (0,1)
-            WHERE t.TABLE_TYPE = 'BASE TABLE'
-            ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME";
+            SELECT SCHEMA_NAME(t.schema_id), t.name,
+                   ISNULL((SELECT SUM(p.rows) FROM sys.partitions p           -- one row per partition
+                           WHERE p.object_id = t.object_id AND p.index_id IN (0,1)), 0) AS [RowCount]
+            FROM sys.tables t
+            WHERE t.is_ms_shipped = 0
+            ORDER BY 1, 2";
 
         return await QueryObjectsAsync(conn, sql, ObjectTypes.Table, r => (long)r.GetInt64(2));
     }

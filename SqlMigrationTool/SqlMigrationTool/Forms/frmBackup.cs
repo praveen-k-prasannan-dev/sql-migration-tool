@@ -363,7 +363,7 @@ public class frmBackup : Form
         // Prerequisites (schemas, types, sequences, synonyms) are always exported.
         var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            ObjectTypes.Schema, ObjectTypes.DataType, ObjectTypes.TableType,
+            ObjectTypes.Schema, ObjectTypes.XmlSchema, ObjectTypes.DataType, ObjectTypes.TableType, ObjectTypes.Partition,
             ObjectTypes.Sequence, ObjectTypes.Synonym, ObjectTypes.DbTrigger, ObjectTypes.ExtendedProperty
         };
         if (hasTable)   { show.Add(ObjectTypes.Table); show.Add(ObjectTypes.Data); show.Add(ObjectTypes.Fk); show.Add(ObjectTypes.Index); }

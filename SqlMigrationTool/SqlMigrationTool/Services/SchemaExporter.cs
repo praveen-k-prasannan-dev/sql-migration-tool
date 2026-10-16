@@ -113,6 +113,7 @@ public class SchemaExporter
         var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
         var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
         lines.AddRange(constraints);
+        var placement = await GetTablePlacementAsync(conn, objectId);
 
         var name = SqlNames.Quote(tbl.Schema, tbl.Name);
         var sb = new StringBuilder();
@@ -122,7 +123,7 @@ public class SchemaExporter
         sb.AppendLine("GO");
         sb.AppendLine($"CREATE TABLE {name} (");
         sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
-        sb.AppendLine(")");
+        sb.AppendLine(")" + placement);
         sb.AppendLine("GO");
 
         foreach (var check in disabledChecks)
@@ -595,6 +596,147 @@ public class SchemaExporter
             count++;
         }
         return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>CREATE XML SCHEMA COLLECTION for every user collection, or null when there are none.</summary>
+    public async Task<string?> ScriptXmlSchemaCollectionsAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(x.schema_id), x.name,
+                   CAST(XML_SCHEMA_NAMESPACE(SCHEMA_NAME(x.schema_id), x.name) AS nvarchar(max))
+            FROM sys.xml_schema_collections x
+            WHERE x.xml_collection_id > 1   -- 1 is the built-in sys collection
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- XML schema collections");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var (schema, name) = (rdr.GetString(0), rdr.GetString(1));
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE schema_id = SCHEMA_ID({SqlNames.Literal(schema)}) AND name = {SqlNames.Literal(name)})");
+            sb.AppendLine($"    CREATE XML SCHEMA COLLECTION {SqlNames.Quote(schema, name)} AS {SqlNames.Literal(rdr.GetString(2))};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// Partition functions and schemes, or null when there are none. A scheme is
+    /// created on its original filegroups when they all exist on the target, and
+    /// otherwise ALL TO ([PRIMARY]); that choice is made when the script runs.
+    /// </summary>
+    public async Task<string?> ScriptPartitioningAsync()
+    {
+        const string sql = @"
+            SELECT pf.function_id, pf.name, pf.boundary_value_on_right,
+                   TYPE_NAME(pp.system_type_id), pp.max_length, pp.precision, pp.scale
+            FROM sys.partition_functions pf
+            JOIN sys.partition_parameters pp ON pp.function_id = pf.function_id
+            ORDER BY pf.name;
+
+            SELECT v.function_id,
+                   CAST(SQL_VARIANT_PROPERTY(v.value, 'BaseType') AS sysname),
+                   CASE WHEN SQL_VARIANT_PROPERTY(v.value, 'BaseType')
+                             IN ('date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset', 'time')
+                        THEN CONVERT(nvarchar(4000), v.value, 126)
+                        ELSE CAST(v.value AS nvarchar(4000)) END
+            FROM sys.partition_range_values v
+            ORDER BY v.function_id, v.boundary_id;
+
+            SELECT ps.name, pf.name, ds.name
+            FROM sys.partition_schemes ps
+            JOIN sys.partition_functions pf      ON pf.function_id = ps.function_id
+            JOIN sys.destination_data_spaces dds ON dds.partition_scheme_id = ps.data_space_id
+            JOIN sys.data_spaces ds              ON ds.data_space_id = dds.data_space_id
+            ORDER BY ps.name, dds.destination_id;";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var functions = new List<(int id, string name, bool right, string type)>();
+        while (await rdr.ReadAsync())
+            functions.Add((rdr.GetInt32(0), rdr.GetString(1), rdr.GetBoolean(2),
+                           BuildTypeDef(rdr.GetString(3), rdr.GetInt16(4), rdr.GetByte(5), rdr.GetByte(6), null, null, false)));
+
+        var values = new Dictionary<int, List<string>>();
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            if (!values.TryGetValue(rdr.GetInt32(0), out var list)) values[rdr.GetInt32(0)] = list = new();
+            var isNumeric = rdr.GetString(1) is "int" or "bigint" or "smallint" or "tinyint"
+                                               or "decimal" or "numeric" or "float" or "real" or "money" or "smallmoney" or "bit";
+            list.Add(rdr.IsDBNull(2) ? "NULL" : isNumeric ? rdr.GetString(2) : SqlNames.Literal(rdr.GetString(2)));
+        }
+
+        var schemes = new List<(string name, string function, List<string> filegroups)>();
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            if (schemes.Count == 0 || schemes[^1].name != rdr.GetString(0))
+                schemes.Add((rdr.GetString(0), rdr.GetString(1), new()));
+            schemes[^1].filegroups.Add(rdr.GetString(2));
+        }
+
+        if (functions.Count == 0 && schemes.Count == 0) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Partition functions and schemes");
+        sb.AppendLine();
+
+        foreach (var f in functions)
+        {
+            var bounds = string.Join(", ", values.GetValueOrDefault(f.id) ?? new());
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = {SqlNames.Literal(f.name)})");
+            sb.AppendLine($"    CREATE PARTITION FUNCTION {SqlNames.Quote(f.name)} ({f.type})");
+            sb.AppendLine($"        AS RANGE {(f.right ? "RIGHT" : "LEFT")} FOR VALUES ({bounds});");
+            sb.AppendLine("GO");
+        }
+
+        foreach (var s in schemes)
+        {
+            var distinct  = s.filegroups.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var original  = $"CREATE PARTITION SCHEME {SqlNames.Quote(s.name)} AS PARTITION {SqlNames.Quote(s.function)} " +
+                            $"TO ({string.Join(", ", s.filegroups.Select(SqlNames.Quote))})";
+            var fallback  = $"CREATE PARTITION SCHEME {SqlNames.Quote(s.name)} AS PARTITION {SqlNames.Quote(s.function)} " +
+                            "ALL TO ([PRIMARY])";
+
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = {SqlNames.Literal(s.name)})");
+            sb.AppendLine("BEGIN");
+            sb.AppendLine($"    IF (SELECT COUNT(*) FROM sys.filegroups WHERE name IN ({string.Join(", ", distinct.Select(SqlNames.Literal))})) = {distinct.Count}");
+            sb.AppendLine($"        EXEC ({SqlNames.Literal(original)});");
+            sb.AppendLine("    ELSE");
+            sb.AppendLine($"        EXEC ({SqlNames.Literal(fallback)});   -- target lacks the original filegroups");
+            sb.AppendLine("END");
+            sb.AppendLine("GO");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>" ON [scheme] ([column])" for a table stored on a partition scheme, else "".</summary>
+    private static async Task<string> GetTablePlacementAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT ds.name, c.name
+            FROM sys.indexes i
+            JOIN sys.data_spaces ds    ON ds.data_space_id = i.data_space_id AND ds.type = 'PS'
+            JOIN sys.index_columns ic  ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1
+            JOIN sys.columns c         ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.object_id = @id AND i.index_id IN (0, 1)";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+        return await rdr.ReadAsync()
+            ? $" ON {SqlNames.Quote(rdr.GetString(0))} ({SqlNames.Quote(rdr.GetString(1))})"
+            : "";
     }
 
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)

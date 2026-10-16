@@ -40,12 +40,20 @@ public class InstallService
                     var fullPath = Path.Combine(folder,
                         entry.File.Replace('/', Path.DirectorySeparatorChar));
 
+                    var warnings = new List<string>();
                     if (entry.Type == ObjectTypes.Data)
                         await InsertDataFileAsync(fullPath, ct);
                     else
-                        await ExecuteSqlFileAsync(fullPath, ct);
+                        warnings = await ExecuteSqlFileAsync(fullPath, ct);
 
-                    progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                    if (warnings.Count == 0)
+                        progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                    else
+                    {
+                        logger.LogWarnings(entry, warnings);
+                        var more = warnings.Count > 1 ? $" (+{warnings.Count - 1} more, see error.log)" : "";
+                        progress.Report(new InstallProgress(entry, InstallStatus.Warning, warnings[0] + more));
+                    }
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
@@ -65,7 +73,8 @@ public class InstallService
 
     private ScriptMode? _rewrapTo;
 
-    private async Task ExecuteSqlFileAsync(string filePath, CancellationToken ct)
+    /// <summary>Runs a script; returns the warnings it raised (RAISERROR severity <= 10).</summary>
+    private async Task<List<string>> ExecuteSqlFileAsync(string filePath, CancellationToken ct)
     {
         var content = await File.ReadAllTextAsync(filePath, ct);
         if (_rewrapTo is { } mode && ScriptWrapper.IsWrapped(content))
@@ -77,6 +86,15 @@ public class InstallService
             StringSplitOptions.RemoveEmptyEntries);
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        // Informational RAISERRORs from generated scripts (number 50000) are warnings,
+        // e.g. CreateOrAlter column differences. Server chatter has other numbers.
+        var warnings = new List<string>();
+        conn.InfoMessage += (_, e) =>
+        {
+            foreach (SqlError err in e.Errors)
+                if (err.Number == 50000) warnings.Add(err.Message);
+        };
 
         // Files such as indexes.sql hold many independent objects: a failing batch
         // must not stop the rest. Errors are collected and reported together.
@@ -108,6 +126,8 @@ public class InstallService
         if (errors.Count > 1)
             throw new InvalidOperationException(
                 $"{errors.Count} of {executed} statements failed: " + string.Join(" | ", errors));
+
+        return warnings;
     }
 
     private async Task InsertDataFileAsync(string filePath, CancellationToken ct)

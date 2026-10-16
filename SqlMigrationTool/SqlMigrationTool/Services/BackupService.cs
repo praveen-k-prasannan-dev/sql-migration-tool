@@ -56,7 +56,7 @@ public class BackupService
             new(ObjectTypes.Schema,    "schemas",                  "Schemas",                  _schema.ScriptSchemasAsync),
             new(ObjectTypes.XmlSchema, "xml_schema_collections",   "XML Schema Collections",   _schema.ScriptXmlSchemaCollectionsAsync),
             new(ObjectTypes.DataType,  "user_defined_data_types",  "User-Defined Data Types",  _schema.ScriptDataTypesAsync),
-            new(ObjectTypes.TableType, "user_defined_table_types", "User-Defined Table Types", _schema.ScriptTableTypesAsync),
+            new(ObjectTypes.TableType, "user_defined_table_types", "User-Defined Table Types", () => _schema.ScriptTableTypesAsync(_mode)),
             new(ObjectTypes.Partition, "partitioning",             "Partition Functions/Schemes", _schema.ScriptPartitioningAsync),
             new(ObjectTypes.Sequence,  "sequences",                "Sequences",                _schema.ScriptSequencesAsync),
             // Synonyms bind late, so they can be created before their target objects.

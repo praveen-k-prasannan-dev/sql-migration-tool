@@ -235,9 +235,11 @@ public class SchemaExporter
     /// <summary>
     /// CREATE TYPE ... AS TABLE for every user-defined table type, with its columns,
     /// PRIMARY KEY / UNIQUE / CHECK constraints and inline indexes; null when there are none.
-    /// Constraint names are omitted because table types do not allow them.
+    /// Constraint names are omitted because table types do not allow them. Each type
+    /// is wrapped for <paramref name="mode"/> with its column signature, so a changed
+    /// type on the target is detected (see ScriptWrapper).
     /// </summary>
-    public async Task<string?> ScriptTableTypesAsync()
+    public async Task<string?> ScriptTableTypesAsync(ScriptMode mode)
     {
         const string typesSql = @"
             SELECT SCHEMA_NAME(tt.schema_id), tt.name, tt.type_table_object_id, tt.is_memory_optimized
@@ -265,11 +267,20 @@ public class SchemaExporter
             lines.AddRange(await GetTableTypeConstraintsAsync(conn, objectId));
 
             var fullName = SqlNames.Quote(schema, name);
-            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(fullName)}) IS NULL");
-            sb.AppendLine($"    CREATE TYPE {fullName} AS TABLE (");
-            sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"        {l}")));
-            sb.AppendLine(memoryOptimized ? "    ) WITH (MEMORY_OPTIMIZED = ON);" : "    );");
-            sb.AppendLine("GO");
+            await using var sigCmd = new SqlCommand($"SELECT {ScriptWrapper.TableTypeSignatureSql(fullName)}", conn);
+
+            var body = $"CREATE TYPE {fullName} AS TABLE (\r\n" +
+                       string.Join(",\r\n", lines.Select(l => $"    {l}")) +
+                       (memoryOptimized ? "\r\n) WITH (MEMORY_OPTIMIZED = ON)" : "\r\n)");
+            var info = new ScriptObjectInfo
+            {
+                Type      = ObjectTypes.TableType,
+                Schema    = schema,
+                Name      = name,
+                SysType   = "TT",
+                Signature = await sigCmd.ExecuteScalarAsync() as string
+            };
+            sb.Append(ScriptWrapper.Wrap(info, body, mode));
         }
         return sb.ToString();
     }

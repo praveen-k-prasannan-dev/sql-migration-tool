@@ -17,6 +17,9 @@ public sealed record ScriptObjectInfo
     public string? ParentSysType { get; init; }
     public bool    Disabled      { get; init; }          // triggers disabled in the source
 
+    // Table types: column signature (see ScriptWrapper.TableTypeSignatureSql) used to detect changes
+    public string? Signature { get; init; }
+
     // Tables
     public List<ColumnInfo>? Columns         { get; init; }
     public List<string>?     UncheckedChecks { get; init; }   // CHECKs to switch off after CREATE TABLE
@@ -67,9 +70,75 @@ public static class ScriptWrapper
     private static readonly Regex LeadingKeyword =
         new(@"\G(CREATE\s+OR\s+ALTER|CREATE|ALTER)\b", RegexOptions.IgnoreCase);
 
-    /// <summary>Wraps a table or module for <paramref name="mode"/>.</summary>
-    public static string Wrap(ScriptObjectInfo info, string createBody, ScriptMode mode) =>
-        info.SysType == "U" ? WrapTable(info, createBody, mode) : WrapModule(info, createBody, mode);
+    /// <summary>Wraps a table, table type or module for <paramref name="mode"/>.</summary>
+    public static string Wrap(ScriptObjectInfo info, string createBody, ScriptMode mode) => info.SysType switch
+    {
+        "U"  => WrapTable(info, createBody, mode),
+        "TT" => WrapTableType(info, createBody, mode),
+        _    => WrapModule(info, createBody, mode)
+    };
+
+    // ── Table types ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// T-SQL expression giving a table type's column signature (name, type, length,
+    /// precision, scale, nullability per column), or NULL if the type does not exist.
+    /// Evaluated on the source at backup time and on the target at install time.
+    /// </summary>
+    public static string TableTypeSignatureSql(string quotedName) =>
+        "(SELECT STUFF((SELECT N'|' + c.name + N':' + TYPE_NAME(c.user_type_id) + N':' + CAST(c.max_length AS nvarchar(10))" +
+        " + N':' + CAST(c.precision AS nvarchar(5)) + N':' + CAST(c.scale AS nvarchar(5)) + N':' + CAST(c.is_nullable AS nvarchar(1))" +
+        " FROM sys.columns c JOIN sys.table_types tt ON tt.type_table_object_id = c.object_id" +
+        $" WHERE tt.user_type_id = TYPE_ID({SqlNames.Literal(quotedName)}) ORDER BY c.column_id" +
+        " FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 1, N''))";
+
+    /// <summary>
+    /// A table type cannot be altered. When the target's type has different columns:
+    /// CreateOnly warns and leaves it; the other modes drop the procedures and
+    /// functions that use it (phase 1 recreates those in the backup), re-create it
+    /// and warn. An identical existing type is left as is in every mode.
+    /// </summary>
+    private static string WrapTableType(ScriptObjectInfo info, string createBody, ScriptMode mode)
+    {
+        var name = info.QuotedName;
+        var lit  = SqlNames.Literal(name);
+        var sb   = new StringBuilder();
+
+        sb.AppendLine($"-- {info.Type}: {info.Schema}.{info.Name}");
+        sb.AppendLine($"{ObjectMarker}{JsonSerializer.Serialize(info, Json)}>>");
+        sb.AppendLine($"IF TYPE_ID({lit}) IS NOT NULL AND ISNULL({TableTypeSignatureSql(name)}, N'') <> {SqlNames.Literal(info.Signature ?? "")}");
+        sb.AppendLine("BEGIN");
+        if (mode == ScriptMode.CreateOnly)
+        {
+            sb.AppendLine($"    RAISERROR (N'Table type %s differs from the backup; left unchanged (Create Only).', 10, 1, {lit}) WITH NOWAIT;");
+        }
+        else
+        {
+            sb.AppendLine("    DECLARE @drop nvarchar(max) = N'', @dropped nvarchar(2000) = N'';");
+            sb.AppendLine("    SELECT @drop    += N'DROP ' + CASE WHEN o.type = 'P' THEN N'PROCEDURE ' ELSE N'FUNCTION ' END");
+            sb.AppendLine("                     + QUOTENAME(SCHEMA_NAME(o.schema_id)) + N'.' + QUOTENAME(o.name) + N';',");
+            sb.AppendLine("           @dropped += CASE WHEN @dropped = N'' THEN N'' ELSE N', ' END + SCHEMA_NAME(o.schema_id) + N'.' + o.name");
+            sb.AppendLine("    FROM sys.objects o");
+            sb.AppendLine("    WHERE o.type IN ('P', 'FN', 'IF', 'TF') AND o.object_id IN (");
+            sb.AppendLine("        SELECT d.referencing_id FROM sys.sql_expression_dependencies d");
+            sb.AppendLine($"        WHERE d.referenced_class = 6 AND d.referenced_id = TYPE_ID({lit}));");
+            sb.AppendLine("    EXEC (@drop);");
+            sb.AppendLine($"    DROP TYPE {name};");
+            sb.AppendLine("    IF @dropped = N'' SET @dropped = N'none';");
+            sb.AppendLine($"    RAISERROR (N'Table type %s differed from the backup and was re-created. Modules using it were dropped (re-created from the backup if included): %s.', 10, 1, {lit}, @dropped) WITH NOWAIT;");
+        }
+        sb.AppendLine("END");
+        sb.AppendLine($"IF TYPE_ID({lit}) IS NOT NULL SET NOEXEC ON;");
+        sb.AppendLine(BodyMarker);
+        sb.AppendLine("GO");
+        sb.AppendLine(createBody.Trim());
+        sb.AppendLine("GO");
+        sb.AppendLine(BodyEndMarker);
+        sb.AppendLine("SET NOEXEC OFF;");
+        sb.AppendLine("GO");
+        sb.AppendLine(EndMarker);
+        return sb.ToString();
+    }
 
     // ── Tables ──────────────────────────────────────────────────────────────
 

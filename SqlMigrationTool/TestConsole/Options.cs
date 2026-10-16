@@ -15,6 +15,7 @@ public sealed class Options
     public bool    SkipSetup  { get; private set; }
     public bool    Verbose    { get; private set; }
     public bool    Reinstall  { get; private set; }
+    public bool    KeepTarget { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public string? Folder     { get; private set; }
@@ -52,6 +53,7 @@ public sealed class Options
                 case "--skip-setup": o.SkipSetup  = true; break;
                 case "--verbose":    o.Verbose    = true; break;
                 case "--reinstall":  o.Reinstall  = true; break;
+                case "--keep-target": o.KeepTarget = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--folder":     o.Folder     = Next(); break;
@@ -89,6 +91,7 @@ public sealed class Options
               --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
               --verbose            Show every backup/install progress line
               --folder <path>      install: backup folder containing app_install.config.json
+              --keep-target        install: install over the existing target instead of recreating it
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

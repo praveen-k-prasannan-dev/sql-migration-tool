@@ -1,6 +1,6 @@
 namespace SqlMigrationTool.Models;
 
-public enum InstallStatus { Pending, Running, Done, Error }
+public enum InstallStatus { Pending, Running, Done, Warning, Error }
 
 public class InstallProgress
 {

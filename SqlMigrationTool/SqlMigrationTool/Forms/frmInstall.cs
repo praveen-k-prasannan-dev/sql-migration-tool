@@ -503,6 +503,14 @@ public class frmInstall : Form
                     UpdateSummary(p.Entry.Type, success: true);
                     break;
 
+                case InstallStatus.Warning:   // installed; details in error.log
+                    item.Text             = "!";
+                    item.ForeColor        = Color.Orange;
+                    item.SubItems[4].Text = $"Warning: {p.Message[..Math.Min(p.Message.Length, 60)]}";
+                    progressBar.Value     = Math.Min(progressBar.Value + 1, progressBar.Maximum);
+                    UpdateSummary(p.Entry.Type, success: true);
+                    break;
+
                 case InstallStatus.Error:
                     item.Text             = "✘";
                     item.ForeColor        = Color.Red;

@@ -63,8 +63,11 @@ public static class Commands
     {
         if (o.Folder is null) throw new ArgumentException("install needs --folder <backup folder>");
 
-        Out.Step($"Recreating empty target {o.TargetDb}");
-        await TestDatabase.RecreateAsync(o, o.TargetDb);
+        if (!o.KeepTarget)
+        {
+            Out.Step($"Recreating empty target {o.TargetDb}");
+            await TestDatabase.RecreateAsync(o, o.TargetDb);
+        }
         var installErrors = await InstallCoreAsync(o, o.Folder);
         Report("Install errors", installErrors);
         return installErrors == 0 ? 0 : 1;
@@ -81,6 +84,8 @@ public static class Commands
                 installErrors++;
                 Out.Error($"  {p.Entry.Type} {p.Entry.Object} ({p.Entry.File}): {p.Message}");
             }
+            else if (p.Status == InstallStatus.Warning)
+                Out.Warn($"  ! {p.Entry.Type} {p.Entry.Object}: {p.Message}");
             else if (o.Verbose && p.Status == InstallStatus.Done)
                 Out.Info($"  ✔ {p.Entry.Type} {p.Entry.Object}");
         });

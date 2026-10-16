@@ -29,9 +29,11 @@ public class BackupService
 
         var manifest = new InstallManifest
         {
+            Version               = InstallManifest.CurrentVersion,
             SourceServer          = _cfg.Server,
             SourceDatabase        = _cfg.Database,
-            SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync()
+            SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync(),
+            DatabaseCollation     = await _schema.GetDatabaseCollationAsync()
         };
 
         int orderCounter = 1;

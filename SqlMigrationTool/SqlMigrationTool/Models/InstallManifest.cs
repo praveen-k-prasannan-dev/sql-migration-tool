@@ -2,11 +2,17 @@ namespace SqlMigrationTool.Models;
 
 public class InstallManifest
 {
+    /// <summary>Manifest format written by this build. 2.0 added Phase 0 (prerequisites) and DatabaseCollation.</summary>
+    public const int CurrentMajorVersion = 2;
+    public const string CurrentVersion   = "2.0";
+
+    // Defaults to 1.0 so a manifest without a Version is read as the original format.
     public string              Version               { get; set; } = "1.0";
     public string              Created               { get; set; } = DateTime.Now.ToString("O");
     public string              SourceServer          { get; set; } = "";
     public string              SourceDatabase        { get; set; } = "";
     public int                 SqlCompatibilityLevel { get; set; } = 160;
+    public string?             DatabaseCollation     { get; set; }
     public List<ManifestPhase> Phases                { get; set; } = new();
     public ManifestSummary     Summary               { get; set; } = new();
 }

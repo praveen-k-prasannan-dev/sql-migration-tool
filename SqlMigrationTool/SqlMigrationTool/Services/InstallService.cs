@@ -270,7 +270,16 @@ public class InstallService
             throw new FileNotFoundException("app_install.config.json not found in the selected folder.", path);
 
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<InstallManifest>(json, _jsonOptions)
+        var manifest = JsonSerializer.Deserialize<InstallManifest>(json, _jsonOptions)
             ?? throw new InvalidDataException("Failed to parse app_install.config.json");
+
+        // Newer manifests may contain object types or phases this build cannot install correctly.
+        var major = int.TryParse(manifest.Version.Split('.')[0], out var m) ? m : 0;
+        if (major < 1 || major > InstallManifest.CurrentMajorVersion)
+            throw new InvalidDataException(
+                $"This backup uses manifest version {manifest.Version}, which this version of SQL Migration Tool " +
+                $"cannot install (supported: 1.x - {InstallManifest.CurrentMajorVersion}.x). Please update the tool.");
+
+        return manifest;
     }
 }

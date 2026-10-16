@@ -14,6 +14,7 @@ public sealed class Options
     public int     ChunkSize  { get; private set; } = 2;   // small on purpose: exercises chunk paging
     public bool    SkipSetup  { get; private set; }
     public bool    Verbose    { get; private set; }
+    public string? Folder     { get; private set; }
 
     public ConnectionConfig Config(string database) => new()
     {
@@ -30,7 +31,7 @@ public sealed class Options
         if (args.Length == 0) return null;
 
         var o = new Options { Command = args[0].ToLowerInvariant() };
-        if (o.Command is not ("setup" or "roundtrip" or "compare")) return null;
+        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install")) return null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -47,6 +48,7 @@ public sealed class Options
                 case "--chunk":      o.ChunkSize  = int.Parse(Next()); break;
                 case "--skip-setup": o.SkipSetup  = true; break;
                 case "--verbose":    o.Verbose    = true; break;
+                case "--folder":     o.Folder     = Next(); break;
                 default: return null;
             }
         }
@@ -64,6 +66,7 @@ public sealed class Options
               setup       Recreate the source test database from TestData/full_feature_db.sql
               roundtrip   setup + back up source + install into a fresh target + compare
               compare     Compare source and target databases only
+              install     Install an existing backup (--folder) into a fresh target
 
             Options:
               --server <name>      SQL Server instance (default: .)
@@ -75,6 +78,7 @@ public sealed class Options
               --chunk <rows>       Backup chunk size (default: 2)
               --skip-setup         roundtrip: use the existing source database as-is
               --verbose            Show every backup/install progress line
+              --folder <path>      install: backup folder containing app_install.config.json
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

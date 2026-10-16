@@ -677,6 +677,13 @@ public class SchemaExporter
         return (lines, disabled);
     }
 
+    public async Task<string?> GetDatabaseCollationAsync()
+    {
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname)", conn);
+        return await cmd.ExecuteScalarAsync() as string;
+    }
+
     public async Task<int> GetCompatibilityLevelAsync()
     {
         const string sql = "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()";

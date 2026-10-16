@@ -39,7 +39,33 @@ public static class Commands
         await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None);
         Out.Info($"  Backup folder: {folder}");
 
-        // ── Install ─────────────────────────────────────────────────────────
+        var installErrors = await InstallCoreAsync(o, folder);
+
+        // ── Compare ─────────────────────────────────────────────────────────
+        var differences = await CompareCoreAsync(o);
+
+        Console.WriteLine();
+        Out.Step("Round-trip result");
+        Report("Backup failures", backupFailures);
+        Report("Install errors",  installErrors);
+        Report("Differences",     differences);
+        return backupFailures + installErrors + differences == 0 ? 0 : 1;
+    }
+
+    /// <summary>Installs an existing backup folder into a freshly recreated target.</summary>
+    public static async Task<int> InstallAsync(Options o)
+    {
+        if (o.Folder is null) throw new ArgumentException("install needs --folder <backup folder>");
+
+        Out.Step($"Recreating empty target {o.TargetDb}");
+        await TestDatabase.RecreateAsync(o, o.TargetDb);
+        var installErrors = await InstallCoreAsync(o, o.Folder);
+        Report("Install errors", installErrors);
+        return installErrors == 0 ? 0 : 1;
+    }
+
+    private static async Task<int> InstallCoreAsync(Options o, string folder)
+    {
         Out.Step($"Installing into {o.TargetDb}");
         int installErrors = 0;
         var installProgress = new SyncProgress<InstallProgress>(p =>
@@ -53,17 +79,9 @@ public static class Commands
                 Out.Info($"  ✔ {p.Entry.Type} {p.Entry.Object}");
         });
         var manifest = InstallService.LoadManifest(folder);
+        Out.Info($"  Manifest version {manifest.Version}");
         await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None);
-
-        // ── Compare ─────────────────────────────────────────────────────────
-        var differences = await CompareCoreAsync(o);
-
-        Console.WriteLine();
-        Out.Step("Round-trip result");
-        Report("Backup failures", backupFailures);
-        Report("Install errors",  installErrors);
-        Report("Differences",     differences);
-        return backupFailures + installErrors + differences == 0 ? 0 : 1;
+        return installErrors;
     }
 
     public static async Task<int> CompareAsync(Options o)

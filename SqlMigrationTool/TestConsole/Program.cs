@@ -16,6 +16,7 @@ try
         "setup"     => await Commands.SetupAsync(opts),
         "roundtrip" => await Commands.RoundTripAsync(opts),
         "compare"   => await Commands.CompareAsync(opts),
+        "install"   => await Commands.InstallAsync(opts),
         _           => 2
     };
 }

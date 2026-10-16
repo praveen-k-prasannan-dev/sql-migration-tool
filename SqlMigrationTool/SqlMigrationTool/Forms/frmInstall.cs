@@ -28,19 +28,6 @@ public class frmInstall : Form
     private readonly Dictionary<string, int[]>               _summaryData  = new(); // [total, success, failed]
     private readonly Dictionary<string, ListViewItem>        _summaryItems = new();
 
-    // Fixed display order and labels for summary rows
-    private static readonly (string Type, string Label)[] SummaryRows =
-    {
-        ("TABLE",   "Tables"),
-        ("DATA",    "Data Files"),
-        ("VIEW",    "Views"),
-        ("PROC",    "Stored Procs"),
-        ("FUNC",    "Functions"),
-        ("TRIGGER", "Triggers"),
-        ("FK",      "Foreign Keys"),
-        ("INDEX",   "Indexes"),
-    };
-
     public frmInstall(ConnectionConfig cfg)
     {
         _cfg = cfg;
@@ -322,8 +309,9 @@ public class frmInstall : Form
         var totalFiles = _manifest.Phases.Sum(p => p.Files.Count);
         var s = _manifest.Summary;
         lblManifestInfo.Text =
-            $"✔ app_install.config.json found\r\n" +
-            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})\r\n" +
+            $"✔ app_install.config.json found  (backup format {_manifest.Version})\r\n" +
+            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})" +
+            (_manifest.DatabaseCollation is { } collation ? $"   Collation: {collation}" : "") + "\r\n" +
             $"Files:   {totalFiles} across {_manifest.Phases.Count} phases\r\n" +
             $"Tables:{s.TotalTables}  Views:{s.TotalViews}  Procs:{s.TotalProcedures}  Functions:{s.TotalFunctions}  DataFiles:{s.TotalDataFiles}";
 
@@ -405,7 +393,7 @@ public class frmInstall : Form
         _summaryData.Clear();
         _summaryItems.Clear();
 
-        foreach (var (type, label) in SummaryRows)
+        foreach (var (type, label) in ObjectTypes.SummaryRows)
         {
             if (!typeCounts.TryGetValue(type, out var total)) continue;
 

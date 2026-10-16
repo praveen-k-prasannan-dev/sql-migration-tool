@@ -29,128 +29,115 @@ public class BackupService
 
         var manifest = new InstallManifest
         {
+            Version               = InstallManifest.CurrentVersion,
             SourceServer          = _cfg.Server,
             SourceDatabase        = _cfg.Database,
-            SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync()
+            SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync(),
+            DatabaseCollation     = await _schema.GetDatabaseCollationAsync()
         };
 
         int orderCounter = 1;
+
+        // ── Phase 0: Prerequisites ───────────────────────────────────────────
+        // Database-wide objects that schema objects depend on. Always exported
+        // in full, whatever the object selection, because they are cheap and a
+        // missing one makes every dependent CREATE fail.
+        progress.Report(new BackupProgress("=== Phase 0: Prerequisites ==="));
+        var phase0    = new ManifestPhase { Phase = 0, Name = "Prerequisites (Schemas, Types)" };
+        var prereqDir = Path.Combine(outputFolder, "00_prerequisites");
+        Directory.CreateDirectory(prereqDir);
+
+        var prereqSteps = new PrereqStep[]
+        {
+            new(ObjectTypes.Schema,   "schemas",                 "Schemas",                  _schema.ScriptSchemasAsync),
+            new(ObjectTypes.DataType,  "user_defined_data_types",  "User-Defined Data Types",  _schema.ScriptDataTypesAsync),
+            new(ObjectTypes.TableType, "user_defined_table_types", "User-Defined Table Types", _schema.ScriptTableTypesAsync),
+        };
+
+        foreach (var step in prereqSteps)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress.Report(new BackupProgress($"> Scripting {step.Label.ToLowerInvariant()}"));
+            try
+            {
+                var script = await step.Script();
+                if (script is null)
+                {
+                    progress.Report(new BackupProgress($"  - {step.Label}: none"));
+                    continue;
+                }
+
+                var fileName = $"{orderCounter:D3}_{step.FileBase}.sql";
+                await File.WriteAllTextAsync(Path.Combine(prereqDir, fileName), script, ct);
+                phase0.Files.Add(new ManifestEntry
+                {
+                    Order  = orderCounter++,
+                    Type   = step.Type,
+                    Object = step.Label,
+                    File   = $"00_prerequisites/{fileName}"
+                });
+                progress.Report(new BackupProgress($"✔ {step.Label} scripted", step.Type, true));
+            }
+            catch (Exception ex)
+            {
+                progress.Report(new BackupProgress($"✘ {step.Label}: {ex.Message}", step.Type, false));
+            }
+        }
+
+        manifest.Phases.Add(phase0);
 
         // ── Phase 1: Schema ──────────────────────────────────────────────────
         progress.Report(new BackupProgress("=== Phase 1: Schema ==="));
         var phase1 = new ManifestPhase { Phase = 1, Name = "Schema (Tables, Views, Functions, Stored Procedures)" };
 
-        var tables   = selectedObjects.Where(o => o.Type == "TABLE").ToList();
-        var views    = selectedObjects.Where(o => o.Type == "VIEW").ToList();
-        var funcs    = selectedObjects.Where(o => o.Type == "FUNC").ToList();
-        var procs    = selectedObjects.Where(o => o.Type == "PROC").ToList();
-        var triggers = selectedObjects.Where(o => o.Type == "TRIGGER").ToList();
+        var tables   = selectedObjects.Where(o => o.Type == ObjectTypes.Table).ToList();
+        var views    = selectedObjects.Where(o => o.Type == ObjectTypes.View).ToList();
+        var funcs    = selectedObjects.Where(o => o.Type == ObjectTypes.Func).ToList();
+        var procs    = selectedObjects.Where(o => o.Type == ObjectTypes.Proc).ToList();
+        var triggers = selectedObjects.Where(o => o.Type == ObjectTypes.Trigger).ToList();
 
-        // Tables
-        var tablesDir = Path.Combine(outputFolder, "01_schema", "tables");
-        Directory.CreateDirectory(tablesDir);
-        foreach (var obj in tables)
-        {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting TABLE {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptTableAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(tablesDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
-                {
-                    Order  = orderCounter++,
-                    Type   = "TABLE",
-                    Object = obj.FullName,
-                    File   = $"01_schema/tables/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ TABLE {obj.FullName}", "TABLE", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ TABLE {obj.FullName}: {ex.Message}", "TABLE", false));
-            }
-        }
+        // Views, functions and procedures share one folder, written in dependency
+        // order so each object is created after the objects it references.
+        var programmable = selectedObjects
+            .Where(o => o.Type is ObjectTypes.View or ObjectTypes.Func or ObjectTypes.Proc)
+            .ToList();
+        var (orderedProgrammable, cyclic) = await DependencyResolver.OrderAsync(_cfg, programmable);
+        foreach (var obj in cyclic)
+            progress.Report(new BackupProgress($"  ! {obj.Type} {obj.FullName} is part of a dependency cycle; it may need a second install run"));
 
-        // Views
-        var viewsDir = Path.Combine(outputFolder, "01_schema", "views");
-        Directory.CreateDirectory(viewsDir);
-        foreach (var obj in views)
+        var schemaSteps = new SchemaStep[]
         {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting VIEW {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptViewAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(viewsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
-                {
-                    Order  = orderCounter++,
-                    Type   = "VIEW",
-                    Object = obj.FullName,
-                    File   = $"01_schema/views/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ VIEW {obj.FullName}", "VIEW", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ VIEW {obj.FullName}: {ex.Message}", "VIEW", false));
-            }
-        }
+            new("tables",          tables),
+            new("programmability", orderedProgrammable),
+        };
 
-        // Functions
-        var funcsDir = Path.Combine(outputFolder, "01_schema", "functions");
-        Directory.CreateDirectory(funcsDir);
-        foreach (var obj in funcs)
+        foreach (var step in schemaSteps)
         {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting FUNC {obj.FullName}"));
-            try
-            {
-                var script   = await _schema.ScriptFuncAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(funcsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
-                {
-                    Order  = orderCounter++,
-                    Type   = "FUNC",
-                    Object = obj.FullName,
-                    File   = $"01_schema/functions/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ FUNC {obj.FullName}", "FUNC", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ FUNC {obj.FullName}: {ex.Message}", "FUNC", false));
-            }
-        }
+            var stepDir = Path.Combine(outputFolder, "01_schema", step.Folder);
+            Directory.CreateDirectory(stepDir);
 
-        // Stored Procedures
-        var procsDir = Path.Combine(outputFolder, "01_schema", "stored_procedures");
-        Directory.CreateDirectory(procsDir);
-        foreach (var obj in procs)
-        {
-            ct.ThrowIfCancellationRequested();
-            progress.Report(new BackupProgress($"> Scripting PROC {obj.FullName}"));
-            try
+            foreach (var obj in step.Objects)
             {
-                var script   = await _schema.ScriptProcAsync(obj);
-                var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
-                await File.WriteAllTextAsync(Path.Combine(procsDir, fileName), script, ct);
-                phase1.Files.Add(new ManifestEntry
+                ct.ThrowIfCancellationRequested();
+                progress.Report(new BackupProgress($"> Scripting {obj.Type} {obj.FullName}"));
+                try
                 {
-                    Order  = orderCounter++,
-                    Type   = "PROC",
-                    Object = obj.FullName,
-                    File   = $"01_schema/stored_procedures/{fileName}"
-                });
-                progress.Report(new BackupProgress($"✔ PROC {obj.FullName}", "PROC", true));
-            }
-            catch (Exception ex)
-            {
-                progress.Report(new BackupProgress($"✘ PROC {obj.FullName}: {ex.Message}", "PROC", false));
+                    var script   = await ScriptObjectAsync(obj);
+                    var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
+                    await File.WriteAllTextAsync(Path.Combine(stepDir, fileName), script, ct);
+                    phase1.Files.Add(new ManifestEntry
+                    {
+                        Order  = orderCounter++,
+                        Type   = obj.Type,
+                        Object = obj.FullName,
+                        File   = $"01_schema/{step.Folder}/{fileName}"
+                    });
+                    progress.Report(new BackupProgress($"✔ {obj.Type} {obj.FullName}", obj.Type, true));
+                }
+                catch (Exception ex)
+                {
+                    progress.Report(new BackupProgress($"✘ {obj.Type} {obj.FullName}: {ex.Message}", obj.Type, false));
+                }
             }
         }
 
@@ -166,7 +153,7 @@ public class BackupService
 
             if (obj.RowCount == 0)
             {
-                progress.Report(new BackupProgress($"  - DATA {obj.FullName} (0 rows, skipped)", "DATA", true));
+                progress.Report(new BackupProgress($"  - DATA {obj.FullName} (0 rows, skipped)", ObjectTypes.Data, true));
                 continue;
             }
 
@@ -184,18 +171,18 @@ public class BackupService
                     phase2.Files.Add(new ManifestEntry
                     {
                         Order  = orderCounter++,
-                        Type   = "DATA",
+                        Type   = ObjectTypes.Data,
                         Object = obj.FullName,
                         File   = $"02_data/{SanitiseName(obj.FullName)}/{fileName}",
                         Rows   = rowCount
                     });
                 }
 
-                progress.Report(new BackupProgress($"✔ DATA {obj.FullName} ({chunks.Count} chunks)", "DATA", true));
+                progress.Report(new BackupProgress($"✔ DATA {obj.FullName} ({chunks.Count} chunks)", ObjectTypes.Data, true));
             }
             catch (Exception ex)
             {
-                progress.Report(new BackupProgress($"✘ DATA {obj.FullName}: {ex.Message}", "DATA", false));
+                progress.Report(new BackupProgress($"✘ DATA {obj.FullName}: {ex.Message}", ObjectTypes.Data, false));
             }
         }
 
@@ -216,15 +203,15 @@ public class BackupService
             phase3.Files.Add(new ManifestEntry
             {
                 Order  = orderCounter++,
-                Type   = "FK",
+                Type   = ObjectTypes.Fk,
                 Object = "Foreign Keys",
                 File   = "03_relations/001_foreign_keys.sql"
             });
-            progress.Report(new BackupProgress("✔ Foreign keys scripted", "FK", true));
+            progress.Report(new BackupProgress("✔ Foreign keys scripted", ObjectTypes.Fk, true));
         }
         catch (Exception ex)
         {
-            progress.Report(new BackupProgress($"✘ Foreign keys: {ex.Message}", "FK", false));
+            progress.Report(new BackupProgress($"✘ Foreign keys: {ex.Message}", ObjectTypes.Fk, false));
         }
 
         // Indexes
@@ -236,15 +223,15 @@ public class BackupService
             phase3.Files.Add(new ManifestEntry
             {
                 Order  = orderCounter++,
-                Type   = "INDEX",
+                Type   = ObjectTypes.Index,
                 Object = "Indexes",
                 File   = "03_relations/002_indexes.sql"
             });
-            progress.Report(new BackupProgress("✔ Indexes scripted", "INDEX", true));
+            progress.Report(new BackupProgress("✔ Indexes scripted", ObjectTypes.Index, true));
         }
         catch (Exception ex)
         {
-            progress.Report(new BackupProgress($"✘ Indexes: {ex.Message}", "INDEX", false));
+            progress.Report(new BackupProgress($"✘ Indexes: {ex.Message}", ObjectTypes.Index, false));
         }
 
         // Triggers
@@ -266,15 +253,15 @@ public class BackupService
                 phase3.Files.Add(new ManifestEntry
                 {
                     Order  = orderCounter++,
-                    Type   = "TRIGGER",
+                    Type   = ObjectTypes.Trigger,
                     Object = "Triggers",
                     File   = "03_relations/003_triggers.sql"
                 });
-                progress.Report(new BackupProgress($"✔ {triggers.Count} trigger(s) scripted", "TRIGGER", true));
+                progress.Report(new BackupProgress($"✔ {triggers.Count} trigger(s) scripted", ObjectTypes.Trigger, true));
             }
             catch (Exception ex)
             {
-                progress.Report(new BackupProgress($"✘ Triggers: {ex.Message}", "TRIGGER", false));
+                progress.Report(new BackupProgress($"✘ Triggers: {ex.Message}", ObjectTypes.Trigger, false));
             }
         }
 
@@ -297,6 +284,19 @@ public class BackupService
         progress.Report(new BackupProgress($"✔ Backup complete. {manifest.Summary.TotalFiles} files written."));
         progress.Report(new BackupProgress($"  Manifest: {manifestPath}"));
     }
+
+    private sealed record PrereqStep(string Type, string FileBase, string Label, Func<Task<string?>> Script);
+
+    private sealed record SchemaStep(string Folder, List<DatabaseObject> Objects);
+
+    private Task<string> ScriptObjectAsync(DatabaseObject obj) => obj.Type switch
+    {
+        ObjectTypes.Table => _schema.ScriptTableAsync(obj),
+        ObjectTypes.View  => _schema.ScriptViewAsync(obj),
+        ObjectTypes.Func  => _schema.ScriptFuncAsync(obj),
+        ObjectTypes.Proc  => _schema.ScriptProcAsync(obj),
+        _ => throw new NotSupportedException($"No scripter for object type {obj.Type}")
+    };
 
     private static string SanitiseName(string name)
         => name.Replace('.', '_').Replace('[', '_').Replace(']', '_')

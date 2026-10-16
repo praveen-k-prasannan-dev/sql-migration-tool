@@ -29,15 +29,14 @@ public class SchemaExporter
     private static async Task<List<DatabaseObject>> ListTablesAsync(SqlConnection conn)
     {
         const string sql = @"
-            SELECT t.TABLE_SCHEMA, t.TABLE_NAME, ISNULL(p.rows, 0) AS [RowCount]
-            FROM INFORMATION_SCHEMA.TABLES t
-            LEFT JOIN sys.partitions p
-                ON p.object_id = OBJECT_ID(t.TABLE_SCHEMA + '.' + t.TABLE_NAME)
-               AND p.index_id IN (0,1)
-            WHERE t.TABLE_TYPE = 'BASE TABLE'
-            ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME";
+            SELECT SCHEMA_NAME(t.schema_id), t.name,
+                   ISNULL((SELECT SUM(p.rows) FROM sys.partitions p           -- one row per partition
+                           WHERE p.object_id = t.object_id AND p.index_id IN (0,1)), 0) AS [RowCount]
+            FROM sys.tables t
+            WHERE t.is_ms_shipped = 0
+            ORDER BY 1, 2";
 
-        return await QueryObjectsAsync(conn, sql, "TABLE", r => (long)r.GetInt64(2));
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Table, r => (long)r.GetInt64(2));
     }
 
     private static async Task<List<DatabaseObject>> ListViewsAsync(SqlConnection conn)
@@ -47,7 +46,7 @@ public class SchemaExporter
             FROM INFORMATION_SCHEMA.VIEWS
             ORDER BY TABLE_SCHEMA, TABLE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "VIEW");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.View);
     }
 
     private static async Task<List<DatabaseObject>> ListStoredProcsAsync(SqlConnection conn)
@@ -58,7 +57,7 @@ public class SchemaExporter
             WHERE ROUTINE_TYPE = 'PROCEDURE'
             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "PROC");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Proc);
     }
 
     private static async Task<List<DatabaseObject>> ListFunctionsAsync(SqlConnection conn)
@@ -69,7 +68,7 @@ public class SchemaExporter
             WHERE ROUTINE_TYPE = 'FUNCTION'
             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
 
-        return await QueryObjectsAsync(conn, sql, "FUNC");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Func);
     }
 
     private static async Task<List<DatabaseObject>> ListTriggersAsync(SqlConnection conn)
@@ -78,9 +77,10 @@ public class SchemaExporter
             SELECT OBJECT_SCHEMA_NAME(parent_id), name, 0
             FROM sys.triggers
             WHERE is_ms_shipped = 0
+              AND parent_class = 1   -- table/view triggers only; database triggers have no schema
             ORDER BY name";
 
-        return await QueryObjectsAsync(conn, sql, "TRIGGER");
+        return await QueryObjectsAsync(conn, sql, ObjectTypes.Trigger);
     }
 
     private static async Task<List<DatabaseObject>> QueryObjectsAsync(
@@ -109,32 +109,27 @@ public class SchemaExporter
     {
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
-        var columns = await GetColumnDefsAsync(conn, tbl.Schema, tbl.Name);
-        var pkCols  = await GetPrimaryKeyColsAsync(conn, tbl.Schema, tbl.Name);
-        var pkName  = await GetPrimaryKeyNameAsync(conn, tbl.Schema, tbl.Name);
+        var objectId = await GetObjectIdAsync(conn, tbl.Schema, tbl.Name);
+        var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
+        var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
+        lines.AddRange(constraints);
 
+        var name = SqlNames.Quote(tbl.Schema, tbl.Name);
         var sb = new StringBuilder();
         sb.AppendLine($"-- Table: {tbl.FullName}");
-        sb.AppendLine($"IF OBJECT_ID(N'[{tbl.Schema}].[{tbl.Name}]','U') IS NOT NULL");
-        sb.AppendLine($"    DROP TABLE [{tbl.Schema}].[{tbl.Name}]");
+        sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)},'U') IS NOT NULL");
+        sb.AppendLine($"    DROP TABLE {name}");
         sb.AppendLine("GO");
-        sb.AppendLine($"CREATE TABLE [{tbl.Schema}].[{tbl.Name}] (");
-
-        for (int i = 0; i < columns.Count; i++)
-        {
-            var col  = columns[i];
-            var comma = (i < columns.Count - 1 || pkCols.Count > 0) ? "," : "";
-            sb.AppendLine($"    {col}{comma}");
-        }
-
-        if (pkCols.Count > 0 && !string.IsNullOrEmpty(pkName))
-        {
-            var pkColList = string.Join(", ", pkCols.Select(c => $"[{c}]"));
-            sb.AppendLine($"    CONSTRAINT [{pkName}] PRIMARY KEY CLUSTERED ({pkColList})");
-        }
-
+        sb.AppendLine($"CREATE TABLE {name} (");
+        sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
         sb.AppendLine(")");
         sb.AppendLine("GO");
+
+        foreach (var check in disabledChecks)
+        {
+            sb.AppendLine($"ALTER TABLE {name} NOCHECK CONSTRAINT {SqlNames.Quote(check)}");
+            sb.AppendLine("GO");
+        }
         return sb.ToString();
     }
 
@@ -159,10 +154,10 @@ public class SchemaExporter
 
         var typeLabel = obj.Type switch
         {
-            "VIEW"    => "V",
-            "PROC"    => "P",
-            "FUNC"    => "FN",
-            "TRIGGER" => "TR",
+            ObjectTypes.View    => "V",
+            ObjectTypes.Proc    => "P",
+            ObjectTypes.Func    => "FN",
+            ObjectTypes.Trigger => "TR",
             _         => "U"
         };
 
@@ -172,10 +167,10 @@ public class SchemaExporter
 
         var dropType = obj.Type switch
         {
-            "VIEW"    => "VIEW",
-            "PROC"    => "PROCEDURE",
-            "FUNC"    => "FUNCTION",
-            "TRIGGER" => "TRIGGER",
+            ObjectTypes.View    => "VIEW",
+            ObjectTypes.Proc    => "PROCEDURE",
+            ObjectTypes.Func    => "FUNCTION",
+            ObjectTypes.Trigger => "TRIGGER",
             _         => "OBJECT"
         };
         sb.AppendLine($"    DROP {dropType} [{obj.Schema}].[{obj.Name}]");
@@ -183,6 +178,181 @@ public class SchemaExporter
         sb.AppendLine(trimmed);
         sb.AppendLine("GO");
         return sb.ToString();
+    }
+
+    // ── Prerequisites ───────────────────────────────────────────────────────
+
+    /// <summary>CREATE SCHEMA for every user schema, or null when there are none besides dbo.</summary>
+    public async Task<string?> ScriptSchemasAsync()
+    {
+        // schema_id 1-4 are dbo/guest/INFORMATION_SCHEMA/sys; 16384+ are fixed-role schemas.
+        const string sql = @"
+            SELECT name FROM sys.schemas
+            WHERE schema_id BETWEEN 5 AND 16383
+            ORDER BY name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Schemas");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = rdr.GetString(0);
+            sb.AppendLine($"IF SCHEMA_ID({SqlNames.Literal(name)}) IS NULL");
+            sb.AppendLine($"    EXEC({SqlNames.Literal($"CREATE SCHEMA {SqlNames.Quote(name)}")});");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>CREATE TYPE ... FROM for every alias (user-defined data) type, or null when there are none.</summary>
+    public async Task<string?> ScriptDataTypesAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(t.schema_id), t.name, TYPE_NAME(t.system_type_id),
+                   t.max_length, t.precision, t.scale, t.is_nullable
+            FROM sys.types t
+            WHERE t.is_user_defined = 1 AND t.is_table_type = 0 AND t.is_assembly_type = 0
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- User-Defined Data Types");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name     = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            var baseType = BuildTypeDef(rdr.GetString(2), rdr.GetInt16(3), rdr.GetByte(4), rdr.GetByte(5),
+                                        null, null, false);
+            var nullable = rdr.GetBoolean(6) ? "NULL" : "NOT NULL";
+
+            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(name)}) IS NULL");
+            sb.AppendLine($"    CREATE TYPE {name} FROM {baseType} {nullable};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// CREATE TYPE ... AS TABLE for every user-defined table type, with its columns,
+    /// PRIMARY KEY / UNIQUE / CHECK constraints and inline indexes; null when there are none.
+    /// Constraint names are omitted because table types do not allow them.
+    /// </summary>
+    public async Task<string?> ScriptTableTypesAsync()
+    {
+        const string typesSql = @"
+            SELECT SCHEMA_NAME(tt.schema_id), tt.name, tt.type_table_object_id, tt.is_memory_optimized
+            FROM sys.table_types tt
+            WHERE tt.is_user_defined = 1
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        var types = new List<(string schema, string name, int objectId, bool memoryOptimized)>();
+        await using (var cmd = new SqlCommand(typesSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
+            while (await rdr.ReadAsync())
+                types.Add((rdr.GetString(0), rdr.GetString(1), rdr.GetInt32(2), rdr.GetBoolean(3)));
+
+        if (types.Count == 0) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- User-Defined Table Types");
+        sb.AppendLine();
+
+        foreach (var (schema, name, objectId, memoryOptimized) in types)
+        {
+            var lines = await GetColumnDefsAsync(conn, objectId, forTableType: true);
+            lines.AddRange(await GetTableTypeConstraintsAsync(conn, objectId));
+
+            var fullName = SqlNames.Quote(schema, name);
+            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(fullName)}) IS NULL");
+            sb.AppendLine($"    CREATE TYPE {fullName} AS TABLE (");
+            sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"        {l}")));
+            sb.AppendLine(memoryOptimized ? "    ) WITH (MEMORY_OPTIMIZED = ON);" : "    );");
+            sb.AppendLine("GO");
+        }
+        return sb.ToString();
+    }
+
+    private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT 'K' AS Kind, i.index_id, i.name, i.type_desc, i.is_unique,
+                   i.is_primary_key, NULL AS Definition
+            FROM sys.indexes i
+            WHERE i.object_id = @id AND i.type > 0
+            UNION ALL
+            SELECT 'C', NULL, NULL, NULL, NULL, NULL, cc.definition
+            FROM sys.check_constraints cc
+            WHERE cc.parent_object_id = @id
+            ORDER BY Kind DESC, index_id";
+
+        var keyColumns = await GetIndexKeyColumnsAsync(conn, objectId);
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var lines = new List<string>();
+        while (await rdr.ReadAsync())
+        {
+            if (rdr.GetString(0) == "C")
+            {
+                lines.Add($"CHECK {rdr.GetString(6)}");
+                continue;
+            }
+
+            var cols      = keyColumns[rdr.GetInt32(1)];
+            var clustered = rdr.GetString(3);              // CLUSTERED / NONCLUSTERED / HASH ...
+            var unique    = rdr.GetBoolean(4);
+
+            if (rdr.GetBoolean(5))
+                lines.Add($"PRIMARY KEY {clustered} ({cols})");
+            else if (rdr.IsDBNull(2) || unique && IsSystemIndexName(rdr.GetString(2)))
+                lines.Add($"UNIQUE {clustered} ({cols})"); // inline UNIQUE constraint
+            else
+                lines.Add($"INDEX {SqlNames.Quote(rdr.GetString(2))}{(unique ? " UNIQUE" : "")} {clustered} ({cols})");
+        }
+        return lines;
+    }
+
+    // System-generated constraint index names look like UQ__IdList__3214EC27A1B2C3D4.
+    private static bool IsSystemIndexName(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, @"^(UQ|PK)__.+__[0-9A-F]{16}$");
+
+    /// <summary>Key column list per index_id, e.g. "[A], [B] DESC".</summary>
+    private static async Task<Dictionary<int, string>> GetIndexKeyColumnsAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT ic.index_id, c.name, ic.is_descending_key
+            FROM sys.index_columns ic
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = @id AND ic.key_ordinal > 0
+            ORDER BY ic.index_id, ic.key_ordinal";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var cols = new Dictionary<int, List<string>>();
+        while (await rdr.ReadAsync())
+        {
+            var indexId = rdr.GetInt32(0);
+            if (!cols.TryGetValue(indexId, out var list)) cols[indexId] = list = new();
+            list.Add(SqlNames.Quote(rdr.GetString(1)) + (rdr.GetBoolean(2) ? " DESC" : ""));
+        }
+        return cols.ToDictionary(kv => kv.Key, kv => string.Join(", ", kv.Value));
     }
 
     public async Task<string> ScriptForeignKeysAsync()
@@ -316,127 +486,202 @@ public class SchemaExporter
 
     // ── Column helpers ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Column definitions for a table or table type, read from sys.columns so that
+    /// alias types, collations, precision and column options survive the round trip.
+    /// Named defaults keep their names except inside table types, where constraint
+    /// names are not allowed.
+    /// </summary>
     private static async Task<List<string>> GetColumnDefsAsync(
-        SqlConnection conn, string schema, string table)
+        SqlConnection conn, int objectId, bool forTableType)
     {
         const string sql = @"
-            SELECT c.COLUMN_NAME, c.DATA_TYPE,
-                   c.CHARACTER_MAXIMUM_LENGTH,
-                   c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
-                   c.IS_NULLABLE, c.COLUMN_DEFAULT,
-                   COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME),c.COLUMN_NAME,'IsIdentity') AS IsIdentity,
-                   IDENT_SEED(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)  AS IdentSeed,
-                   IDENT_INCR(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)  AS IdentIncr,
-                   COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME),c.COLUMN_NAME,'IsComputed') AS IsComputed,
-                   cc.definition  AS ComputedDef,
-                   cc.is_persisted AS IsPersisted
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            LEFT JOIN sys.computed_columns cc
-                ON cc.object_id = OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)
-               AND cc.name = c.COLUMN_NAME
-            WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
-            ORDER BY c.ORDINAL_POSITION";
+            SELECT c.name,
+                   ty.name                          AS TypeName,
+                   ty.is_user_defined               AS IsAliasType,
+                   SCHEMA_NAME(ty.schema_id)        AS TypeSchema,
+                   c.max_length, c.precision, c.scale,
+                   c.is_nullable,
+                   c.collation_name,
+                   CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname) AS DbCollation,
+                   c.is_identity,
+                   CAST(ic.seed_value      AS varchar(40)) AS IdentSeed,
+                   CAST(ic.increment_value AS varchar(40)) AS IdentIncr,
+                   ic.is_not_for_replication        AS IdentNotForRepl,
+                   cc.definition                    AS ComputedDef,
+                   cc.is_persisted,
+                   c.is_sparse, c.is_rowguidcol, c.is_filestream,
+                   dc.name                          AS DefaultName,
+                   dc.definition                    AS DefaultDef,
+                   dc.is_system_named               AS DefaultAutoNamed,
+                   SCHEMA_NAME(x.schema_id)         AS XmlSchema,
+                   x.name                           AS XmlCollection,
+                   c.is_xml_document
+            FROM sys.columns c
+            JOIN sys.types ty                      ON ty.user_type_id = c.user_type_id
+            LEFT JOIN sys.identity_columns ic      ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            LEFT JOIN sys.computed_columns cc      ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+            LEFT JOIN sys.default_constraints dc   ON dc.object_id = c.default_object_id
+            LEFT JOIN sys.xml_schema_collections x ON x.xml_collection_id = c.xml_collection_id
+                                                  AND c.xml_collection_id > 1
+            WHERE c.object_id = @id
+            ORDER BY c.column_id";
 
         await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
+        cmd.Parameters.AddWithValue("@id", objectId);
 
         var defs = new List<string>();
         await using var rdr = await cmd.ExecuteReaderAsync();
         while (await rdr.ReadAsync())
         {
-            var colName    = rdr.GetString(0);
-            var dataType   = rdr.GetString(1).ToUpper();
-            var charMax    = rdr.IsDBNull(2) ? (int?)null : rdr.GetInt32(2);
-            var numPrec    = rdr.IsDBNull(3) ? (int?)null : rdr.GetByte(3);
-            var numScale   = rdr.IsDBNull(4) ? (int?)null : rdr.GetInt32(4);
-            var isNullable = rdr.GetString(5) == "YES";
-            var defVal     = rdr.IsDBNull(6)  ? null : rdr.GetString(6);
-            var isIdent    = !rdr.IsDBNull(7) && rdr.GetInt32(7) == 1;
-            var identSeed  = rdr.IsDBNull(8)  ? 1    : Convert.ToInt32(rdr.GetValue(8));
-            var identIncr  = rdr.IsDBNull(9)  ? 1    : Convert.ToInt32(rdr.GetValue(9));
-            var isComputed  = !rdr.IsDBNull(10) && rdr.GetInt32(10) == 1;
-            var computedDef = rdr.IsDBNull(11)  ? null : rdr.GetString(11);
-            var isPersisted = !rdr.IsDBNull(12) && rdr.GetBoolean(12);
+            string? Str(string col)  => rdr[col] is DBNull ? null : (string)rdr[col];
+            bool    Bool(string col) => rdr[col] is bool b && b;
 
-            if (isComputed)
+            var colName = SqlNames.Quote(rdr.GetString(0));
+
+            var computedDef = Str("ComputedDef");
+            if (computedDef != null)
             {
-                if (computedDef != null)
-                {
-                    var persistedKw = isPersisted ? " PERSISTED" : "";
-                    defs.Add($"[{colName}] AS {computedDef}{persistedKw}");
-                }
+                var persisted = Bool("is_persisted")
+                    ? " PERSISTED" + (Bool("is_nullable") ? "" : " NOT NULL")
+                    : "";
+                defs.Add($"{colName} AS {computedDef}{persisted}");
                 continue;
             }
 
-            var typeDef = BuildTypeDef(dataType, charMax, numPrec, numScale);
-            var identDef = isIdent ? $" IDENTITY({identSeed},{identIncr})" : "";
-            var nullDef  = isNullable ? " NULL" : " NOT NULL";
-            var defDef   = defVal != null ? $" DEFAULT {defVal}" : "";
+            var sb = new StringBuilder(colName).Append(' ');
 
-            defs.Add($"[{colName}] {typeDef}{identDef}{defDef}{nullDef}");
+            sb.Append(Bool("IsAliasType")
+                ? SqlNames.Quote(rdr.GetString(3), rdr.GetString(1))
+                : BuildTypeDef(rdr.GetString(1),
+                               Convert.ToInt32(rdr["max_length"]),
+                               Convert.ToInt32(rdr["precision"]),
+                               Convert.ToInt32(rdr["scale"]),
+                               Str("XmlSchema"), Str("XmlCollection"), Bool("is_xml_document")));
+
+            var collation = Str("collation_name");
+            if (collation != null && collation != Str("DbCollation"))
+                sb.Append($" COLLATE {collation}");
+
+            if (Bool("is_filestream")) sb.Append(" FILESTREAM");
+            if (Bool("is_sparse"))     sb.Append(" SPARSE");
+
+            if (Bool("is_identity"))
+            {
+                sb.Append($" IDENTITY({Str("IdentSeed")},{Str("IdentIncr")})");
+                if (Bool("IdentNotForRepl")) sb.Append(" NOT FOR REPLICATION");
+            }
+
+            if (Bool("is_rowguidcol")) sb.Append(" ROWGUIDCOL");
+
+            sb.Append(Bool("is_nullable") ? " NULL" : " NOT NULL");
+
+            var defaultDef = Str("DefaultDef");
+            if (defaultDef != null)
+            {
+                if (!forTableType && !Bool("DefaultAutoNamed"))
+                    sb.Append($" CONSTRAINT {SqlNames.Quote(Str("DefaultName")!)}");
+                sb.Append($" DEFAULT {defaultDef}");
+            }
+
+            defs.Add(sb.ToString());
         }
         return defs;
     }
 
-    private static string BuildTypeDef(string dt, int? charMax, int? numPrec, int? numScale)
+    /// <summary>T-SQL type declaration for a built-in type, from sys.columns metadata.</summary>
+    private static string BuildTypeDef(string typeName, int maxLength, int precision, int scale,
+                                       string? xmlSchema, string? xmlCollection, bool xmlDocument)
     {
+        var dt = typeName.ToUpperInvariant();
         return dt switch
         {
-            "VARCHAR"   or "NVARCHAR"   or "CHAR" or "NCHAR" or "BINARY" or "VARBINARY"
-                => (charMax == null || charMax == -1)
-                    ? $"{dt}(MAX)"
-                    : $"{dt}({charMax})",
+            "VARCHAR" or "CHAR" or "VARBINARY" or "BINARY"
+                => maxLength == -1 ? $"{dt}(MAX)" : $"{dt}({maxLength})",
 
-            "DECIMAL"   or "NUMERIC"
-                => $"{dt}({numPrec ?? 18},{numScale ?? 2})",
+            // n-types store max_length in bytes: two per character
+            "NVARCHAR" or "NCHAR"
+                => maxLength == -1 ? $"{dt}(MAX)" : $"{dt}({maxLength / 2})",
 
-            "FLOAT"     => $"FLOAT({numPrec ?? 53})",
+            "DECIMAL" or "NUMERIC"
+                => $"{dt}({precision},{scale})",
 
+            // fractional-seconds precision is held in scale
             "DATETIME2" or "TIME" or "DATETIMEOFFSET"
-                => numScale.HasValue ? $"{dt}({numScale})" : dt,
+                => $"{dt}({scale})",
+
+            "XML" when xmlCollection != null
+                => $"XML({(xmlDocument ? "DOCUMENT" : "CONTENT")} {SqlNames.Quote(xmlSchema!, xmlCollection)})",
 
             _ => dt
         };
     }
 
-    private static async Task<List<string>> GetPrimaryKeyColsAsync(
-        SqlConnection conn, string schema, string table)
+    private static async Task<int> GetObjectIdAsync(SqlConnection conn, string schema, string name)
     {
-        const string sql = @"
-            SELECT c.COLUMN_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
-                ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-               AND tc.TABLE_SCHEMA    = c.TABLE_SCHEMA
-               AND tc.TABLE_NAME      = c.TABLE_NAME
-            WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-              AND tc.TABLE_SCHEMA = @schema AND tc.TABLE_NAME = @table
-            ORDER BY c.ORDINAL_POSITION";
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
-
-        var cols = new List<string>();
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        while (await rdr.ReadAsync()) cols.Add(rdr.GetString(0));
-        return cols;
+        await using var cmd = new SqlCommand("SELECT OBJECT_ID(@n)", conn);
+        cmd.Parameters.AddWithValue("@n", SqlNames.Quote(schema, name));
+        return await cmd.ExecuteScalarAsync() is int id
+            ? id
+            : throw new InvalidOperationException($"Object {schema}.{name} not found.");
     }
 
-    private static async Task<string?> GetPrimaryKeyNameAsync(
-        SqlConnection conn, string schema, string table)
+    /// <summary>
+    /// PRIMARY KEY, UNIQUE and CHECK constraint lines for CREATE TABLE, plus the
+    /// names of CHECK constraints that are disabled in the source.
+    /// </summary>
+    private static async Task<(List<string> lines, List<string> disabledChecks)> GetTableConstraintsAsync(
+        SqlConnection conn, int objectId)
     {
         const string sql = @"
-            SELECT CONSTRAINT_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
-            WHERE CONSTRAINT_TYPE = 'PRIMARY KEY'
-              AND TABLE_SCHEMA = @schema AND TABLE_NAME = @table";
+            SELECT k.type, k.name, k.is_system_named, i.index_id, i.type_desc, NULL, 0,
+                   CASE k.type WHEN 'PK' THEN 0 ELSE 1 END AS SortKey
+            FROM sys.key_constraints k
+            JOIN sys.indexes i ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id
+            WHERE k.parent_object_id = @id
+            UNION ALL
+            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition, cc.is_disabled, 2
+            FROM sys.check_constraints cc
+            WHERE cc.parent_object_id = @id
+            ORDER BY SortKey, 2";   // PK, UQ, then CHECK
+
+        var keyColumns = await GetIndexKeyColumnsAsync(conn, objectId);
 
         await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
-        return (string?)await cmd.ExecuteScalarAsync();
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var lines    = new List<string>();
+        var disabled = new List<string>();
+        while (await rdr.ReadAsync())
+        {
+            var kind   = rdr.GetString(0).Trim();
+            var name   = rdr.GetString(1);
+            var prefix = rdr.GetBoolean(2) ? "" : $"CONSTRAINT {SqlNames.Quote(name)} ";
+
+            switch (kind)
+            {
+                case "PK":
+                    lines.Add($"{prefix}PRIMARY KEY {rdr.GetString(4)} ({keyColumns[rdr.GetInt32(3)]})");
+                    break;
+                case "UQ":
+                    lines.Add($"{prefix}UNIQUE {rdr.GetString(4)} ({keyColumns[rdr.GetInt32(3)]})");
+                    break;
+                default:
+                    lines.Add($"{prefix}CHECK {rdr.GetString(5)}");
+                    // A system-named constraint gets a new name on the target, so it cannot be addressed.
+                    if (Convert.ToBoolean(rdr.GetValue(6)) && !rdr.GetBoolean(2)) disabled.Add(name);
+                    break;
+            }
+        }
+        return (lines, disabled);
+    }
+
+    public async Task<string?> GetDatabaseCollationAsync()
+    {
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand("SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname)", conn);
+        return await cmd.ExecuteScalarAsync() as string;
     }
 
     public async Task<int> GetCompatibilityLevelAsync()

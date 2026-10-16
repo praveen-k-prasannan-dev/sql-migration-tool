@@ -10,11 +10,6 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\SqlMigrationTool\Models\*.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\SqlConnectionService.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\SchemaExporter.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\DataExporter.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\BackupService.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\ErrorLogger.cs" />
-    <Compile Include="..\SqlMigrationTool\Services\InstallService.cs" />
+    <Compile Include="..\SqlMigrationTool\Services\*.cs" />
   </ItemGroup>
 </Project>

@@ -166,10 +166,7 @@ public class InstallService
     {
         var content = await ReadScriptAsync(filePath, ct);
 
-        // Split on GO batch separator (SQL Server Management Studio directive)
-        var batches = content.Split(
-            new[] { "\nGO\n", "\nGO\r\n", "\r\nGO\r\n", "\r\nGO\n", "\nGO", "\r\nGO" },
-            StringSplitOptions.RemoveEmptyEntries);
+        var batches = BatchSplitter.Split(content);
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 

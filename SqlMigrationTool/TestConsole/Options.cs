@@ -38,7 +38,7 @@ public sealed class Options
         if (args.Length == 0) return null;
 
         var o = new Options { Command = args[0].ToLowerInvariant() };
-        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install" or "rewrapcheck")) return null;
+        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install" or "rewrapcheck" or "selftest")) return null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -82,6 +82,7 @@ public sealed class Options
               compare     Compare source and target databases only
               install     Install an existing backup (--folder) into a fresh target
               rewrapcheck Back up in every mode and check re-wrapping between modes is exact
+              selftest    Offline checks of helpers (GO splitter, ...)
 
             Options:
               --server <name>      SQL Server instance (default: .)

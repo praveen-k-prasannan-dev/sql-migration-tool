@@ -9,9 +9,6 @@ public static class TestDatabase
 {
     private const string SafePrefix = "SqlMigTest_";
 
-    private static readonly Regex GoSeparator =
-        new(@"^\s*GO\s*$", RegexOptions.Multiline | RegexOptions.IgnoreCase);
-
     public static async Task RecreateAsync(Options o, string database)
     {
         if (!database.StartsWith(SafePrefix, StringComparison.OrdinalIgnoreCase))
@@ -41,8 +38,7 @@ public static class TestDatabase
 
     public static async Task RunScriptAsync(Options o, string database, string scriptPath)
     {
-        var batches = GoSeparator.Split(await File.ReadAllTextAsync(scriptPath))
-                                 .Where(b => !string.IsNullOrWhiteSpace(b));
+        var batches = BatchSplitter.Split(await File.ReadAllTextAsync(scriptPath));
 
         await using var conn = await SqlConnectionService.OpenAsync(o.Config(database));
         foreach (var batch in batches)

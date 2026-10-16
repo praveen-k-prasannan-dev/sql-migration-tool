@@ -19,6 +19,7 @@ try
         "compare"   => await Commands.CompareAsync(opts),
         "install"   => await Commands.InstallAsync(opts),
         "rewrapcheck" => await Commands.RewrapCheckAsync(opts),
+        "selftest"  => SelfTest.Run(),
         _           => 2
     };
 }

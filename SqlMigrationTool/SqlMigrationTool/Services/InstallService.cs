@@ -15,6 +15,73 @@ public class InstallService
 
     public InstallService(ConnectionConfig cfg) => _cfg = cfg;
 
+    /// <summary>A script as it will run: re-wrapped when a different mode was chosen.</summary>
+    private async Task<string> ReadScriptAsync(string filePath, CancellationToken ct)
+    {
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        return _rewrapTo is { } mode && ScriptWrapper.IsWrapped(content)
+            ? ScriptWrapper.Rewrap(content, mode)
+            : content;
+    }
+
+    public const string PreviewFileName = "preview_install.sql";
+
+    /// <summary>
+    /// Writes every script, exactly as the install would run it, to
+    /// preview_install.sql in the backup folder, and notes how each data file would
+    /// be loaded. Nothing is executed and the target is not contacted.
+    /// </summary>
+    public async Task<string> PreviewAsync(
+        string                     folder,
+        InstallManifest            manifest,
+        IProgress<InstallProgress> progress,
+        CancellationToken          ct,
+        ScriptMode?                mode     = null,
+        DataLoadMode               dataMode = DataLoadMode.SkipIfNotEmpty)
+    {
+        var effective = mode ?? ManifestMode(manifest);
+        _rewrapTo = effective != ManifestMode(manifest) ? effective : null;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine("-- SQL Migration Tool - INSTALL PREVIEW (nothing below has been executed)");
+        sb.AppendLine($"-- Backup:      {manifest.SourceServer} / {manifest.SourceDatabase} ({manifest.Created})");
+        sb.AppendLine($"-- Target:      {_cfg.Server} / {_cfg.Database}");
+        sb.AppendLine($"-- Script mode: {ScriptModeText.Label(effective)}");
+        sb.AppendLine($"-- Data:        {DataLoadModeText.Label(dataMode)}");
+        sb.AppendLine($"-- Generated:   {DateTime.Now:yyyy-MM-dd HH:mm}");
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine();
+
+        foreach (var phase in manifest.Phases)
+        {
+            sb.AppendLine($"-- ═══ Phase {phase.Phase}: {phase.Name} ═══");
+            sb.AppendLine();
+            foreach (var entry in phase.Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                progress.Report(new InstallProgress(entry, InstallStatus.Running));
+
+                if (entry.Type == ObjectTypes.Data)
+                {
+                    sb.AppendLine($"-- DATA {entry.Object}: {entry.File} ({entry.Rows:N0} rows) - loaded with \"{DataLoadModeText.Label(dataMode)}\"");
+                }
+                else
+                {
+                    sb.AppendLine($"-- ─── {entry.File} ───");
+                    sb.AppendLine((await ReadScriptAsync(Path.Combine(folder, entry.File.Replace('/', Path.DirectorySeparatorChar)), ct)).TrimEnd());
+                    sb.AppendLine();
+                }
+                progress.Report(new InstallProgress(entry, InstallStatus.Done));
+            }
+            sb.AppendLine();
+        }
+
+        var path = Path.Combine(folder, PreviewFileName);
+        await File.WriteAllTextAsync(path, sb.ToString(), ct);
+        return path;
+    }
+
     public async Task RunAsync(
         string                     folder,
         InstallManifest            manifest,
@@ -97,9 +164,7 @@ public class InstallService
     /// <summary>Runs a script; returns the warnings it raised (RAISERROR severity <= 10).</summary>
     private async Task<List<string>> ExecuteSqlFileAsync(string filePath, CancellationToken ct)
     {
-        var content = await File.ReadAllTextAsync(filePath, ct);
-        if (_rewrapTo is { } mode && ScriptWrapper.IsWrapped(content))
-            content = ScriptWrapper.Rewrap(content, mode);
+        var content = await ReadScriptAsync(filePath, ct);
 
         // Split on GO batch separator (SQL Server Management Studio directive)
         var batches = content.Split(

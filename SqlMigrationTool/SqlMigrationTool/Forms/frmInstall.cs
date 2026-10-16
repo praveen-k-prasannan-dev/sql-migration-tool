@@ -21,6 +21,7 @@ public class frmInstall : Form
     private Button     btnBack         = null!;
     private ComboBox   cmbScriptMode   = null!;
     private ComboBox   cmbDataMode     = null!;
+    private CheckBox   chkPreview      = null!;
 
     private InstallManifest?          _manifest;
     private string                    _folder = "";
@@ -159,6 +160,15 @@ public class frmInstall : Form
             cmbDataMode.Items.Add(new DataLoadModeItem(dataMode));
         cmbDataMode.SelectedIndex = 0;   // Skip tables that have rows: never touches existing data
         content.Controls.Add(cmbDataMode);
+
+        // Dry run: write the scripts as they would run to preview_install.sql, execute nothing.
+        chkPreview = new CheckBox
+        {
+            Text     = "Preview only",
+            Location = new Point(806, y + 5),
+            AutoSize = true
+        };
+        content.Controls.Add(chkPreview);
         y += 38;
 
         // Manifest info panel
@@ -323,6 +333,7 @@ public class frmInstall : Form
             cmbScriptMode.SelectedIndex = cmbScriptMode.Items.Cast<ScriptModeItem>().ToList().FindIndex(i => i.Mode == backupMode);
             cmbScriptMode.Enabled = true;
             cmbDataMode.Enabled   = true;
+            chkPreview.Enabled    = true;
 
             btnStart.Enabled    = true;
             lblStatus.Text      = "Manifest loaded. Ready to install.";
@@ -489,6 +500,7 @@ public class frmInstall : Form
         btnLoad.Enabled   = false;
         cmbScriptMode.Enabled = false;
         cmbDataMode.Enabled   = false;
+        chkPreview.Enabled    = false;
         btnBack.Enabled   = false;
         btnAbort.Enabled  = true;
         progressBar.Value = 0;
@@ -545,6 +557,17 @@ public class frmInstall : Form
             var svc = new InstallService(_cfg);
             var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
             var dataMode = ((DataLoadModeItem)cmbDataMode.SelectedItem!).Mode;
+
+            if (chkPreview.Checked)
+            {
+                var path = await svc.PreviewAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
+                MessageBox.Show($"Nothing was installed. The scripts as they would run were written to:\n\n{path}",
+                    "Preview written", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                lblStatus.Text      = $"Preview written: {InstallService.PreviewFileName} (nothing installed).";
+                lblStatus.ForeColor = Color.DarkGreen;
+                return;
+            }
+
             await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
 
             if (errorCount == 0)
@@ -581,6 +604,7 @@ public class frmInstall : Form
             btnLoad.Enabled  = true;
             cmbScriptMode.Enabled = true;
             cmbDataMode.Enabled   = true;
+            chkPreview.Enabled    = true;
             btnBack.Enabled  = true;
             btnAbort.Enabled = false;
             _cts?.Dispose();

@@ -63,6 +63,15 @@ public static class Commands
     {
         if (o.Folder is null) throw new ArgumentException("install needs --folder <backup folder>");
 
+        if (o.Preview)
+        {
+            var path = await new InstallService(o.Config(o.TargetDb)).PreviewAsync(
+                o.Folder, InstallService.LoadManifest(o.Folder), new SyncProgress<InstallProgress>(_ => { }),
+                CancellationToken.None, o.InstallMode, o.DataMode);
+            Out.Ok($"Preview written: {path}");
+            return 0;
+        }
+
         if (!o.KeepTarget)
         {
             Out.Step($"Recreating empty target {o.TargetDb}");

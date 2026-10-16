@@ -425,6 +425,46 @@ public class SchemaExporter
         return count == 0 ? null : sb.ToString();
     }
 
+    /// <summary>
+    /// Database-level (DDL) triggers, dropped and recreated, and re-disabled where
+    /// disabled in the source; null when there are none. Must run after all other
+    /// DDL, since these triggers fire on (and can block) schema changes.
+    /// </summary>
+    public async Task<string?> ScriptDatabaseTriggersAsync()
+    {
+        const string sql = @"
+            SELECT t.name, m.definition, t.is_disabled
+            FROM sys.triggers t
+            JOIN sys.sql_modules m ON m.object_id = t.object_id
+            WHERE t.parent_class = 0 AND t.is_ms_shipped = 0
+            ORDER BY t.name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Database (DDL) triggers");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = rdr.GetString(0);
+            sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.triggers WHERE parent_class = 0 AND name = {SqlNames.Literal(name)})");
+            sb.AppendLine($"    DROP TRIGGER {SqlNames.Quote(name)} ON DATABASE;");
+            sb.AppendLine("GO");
+            sb.AppendLine(rdr.GetString(1).Trim());
+            sb.AppendLine("GO");
+            if (rdr.GetBoolean(2))
+            {
+                sb.AppendLine($"DISABLE TRIGGER {SqlNames.Quote(name)} ON DATABASE;");
+                sb.AppendLine("GO");
+            }
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"

@@ -257,6 +257,16 @@ BEGIN
     SET NOCOUNT ON;
 END
 GO
+CREATE TRIGGER trgDdlBlockDrop ON DATABASE
+FOR DROP_TABLE
+AS
+BEGIN
+    RAISERROR ('Dropping tables is not allowed.', 16, 1);
+    ROLLBACK;
+END
+GO
+DISABLE TRIGGER trgDdlBlockDrop ON DATABASE;
+GO
 
 -- ── Extended properties ──────────────────────────────────────────────────────
 EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Customer master',

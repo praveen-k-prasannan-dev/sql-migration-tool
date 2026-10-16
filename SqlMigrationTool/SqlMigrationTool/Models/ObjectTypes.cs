@@ -20,6 +20,7 @@ public static class ObjectTypes
     public const string TableType = "UDTT";
     public const string Sequence  = "SEQUENCE";
     public const string Synonym   = "SYNONYM";
+    public const string DbTrigger = "DBTRIGGER";
 
     /// <summary>Display order and labels for the backup/install summary grids.</summary>
     public static readonly (string Type, string Label)[] SummaryRows =
@@ -35,6 +36,7 @@ public static class ObjectTypes
         (Proc,    "Stored Procs"),
         (Func,    "Functions"),
         (Trigger, "Triggers"),
+        (DbTrigger, "Database Triggers"),
         (Fk,      "Foreign Keys"),
         (Index,   "Indexes"),
     };

@@ -134,69 +134,41 @@ public class SchemaExporter
         return sb.ToString();
     }
 
-    public async Task<string> ScriptViewAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "V");
-    public async Task<string> ScriptProcAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "P");
-    public async Task<string> ScriptFuncAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "FN,IF,TF");
-    /// <summary>Table/view trigger; re-disabled after creation when disabled in the source.</summary>
-    public async Task<string> ScriptTriggerAsync(DatabaseObject obj)
+    /// <summary>
+    /// A view, procedure, function or trigger, wrapped for <paramref name="mode"/>
+    /// (see <see cref="ScriptWrapper"/>). Disabled triggers are re-disabled.
+    /// </summary>
+    public async Task<string> ScriptModuleAsync(DatabaseObject obj, ScriptMode mode)
     {
-        var script = await ScriptDefinitionObject(obj, "TR");
+        const string sql = @"
+            SELECT o.type, OBJECT_DEFINITION(o.object_id),
+                   OBJECT_SCHEMA_NAME(o.parent_object_id), OBJECT_NAME(o.parent_object_id), p.type,
+                   CAST(ISNULL(t.is_disabled, 0) AS bit)
+            FROM sys.objects o
+            LEFT JOIN sys.objects  p ON p.object_id = o.parent_object_id
+            LEFT JOIN sys.triggers t ON t.object_id = o.object_id
+            WHERE o.object_id = OBJECT_ID(@n)";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(@"
-            SELECT OBJECT_SCHEMA_NAME(t.parent_id), OBJECT_NAME(t.parent_id)
-            FROM sys.triggers t
-            WHERE t.object_id = OBJECT_ID(@n) AND t.is_disabled = 1", conn);
+        await using var cmd  = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@n", SqlNames.Quote(obj.Schema, obj.Name));
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        if (!await rdr.ReadAsync()) return script;
+        await using var rdr  = await cmd.ExecuteReaderAsync();
 
-        var parent = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
-        return script + $"DISABLE TRIGGER {SqlNames.Quote(obj.Schema, obj.Name)} ON {parent};\r\nGO\r\n";
-    }
+        if (!await rdr.ReadAsync() || rdr.IsDBNull(1))
+            return $"-- WARNING: Could not retrieve definition for {obj.FullName} (encrypted or missing)\r\nGO\r\n";
 
-    private async Task<string> ScriptDefinitionObject(DatabaseObject obj, string typeCode)
-    {
-        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(
-            "SELECT OBJECT_DEFINITION(OBJECT_ID(@n))", conn);
-        cmd.Parameters.AddWithValue("@n", obj.FullName);
-
-        var def = (string?)await cmd.ExecuteScalarAsync();
-        if (string.IsNullOrWhiteSpace(def))
-            return $"-- WARNING: Could not retrieve definition for {obj.FullName}\r\nGO\r\n";
-
-        var trimmed = def.TrimStart();
-
-        // sys.objects type codes per object type. Functions have several: scalar,
-        // inline and multi-statement table-valued, and their CLR equivalents.
-        var typeCodes = obj.Type switch
+        var info = new ScriptObjectInfo
         {
-            ObjectTypes.View    => "'V'",
-            ObjectTypes.Proc    => "'P'",
-            ObjectTypes.Func    => "'FN','IF','TF','FS','FT'",
-            ObjectTypes.Trigger => "'TR'",
-            _                   => "'U'"
+            Type          = obj.Type,
+            Schema        = obj.Schema,
+            Name          = obj.Name,
+            SysType       = rdr.GetString(0).Trim(),
+            ParentSchema  = rdr.IsDBNull(2) ? null : rdr.GetString(2),
+            ParentName    = rdr.IsDBNull(3) ? null : rdr.GetString(3),
+            ParentSysType = rdr.IsDBNull(4) ? null : rdr.GetString(4).Trim(),
+            Disabled      = rdr.GetBoolean(5)
         };
-
-        var name = SqlNames.Quote(obj.Schema, obj.Name);
-        var sb = new StringBuilder();
-        sb.AppendLine($"-- {obj.Type}: {obj.FullName}");
-        sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID({SqlNames.Literal(name)}) AND type IN ({typeCodes}))");
-
-        var dropType = obj.Type switch
-        {
-            ObjectTypes.View    => "VIEW",
-            ObjectTypes.Proc    => "PROCEDURE",
-            ObjectTypes.Func    => "FUNCTION",
-            ObjectTypes.Trigger => "TRIGGER",
-            _         => "OBJECT"
-        };
-        sb.AppendLine($"    DROP {dropType} {name}");
-        sb.AppendLine("GO");
-        sb.AppendLine(trimmed);
-        sb.AppendLine("GO");
-        return sb.ToString();
+        return ScriptWrapper.WrapModule(info, rdr.GetString(1), mode);
     }
 
     // ── Prerequisites ───────────────────────────────────────────────────────

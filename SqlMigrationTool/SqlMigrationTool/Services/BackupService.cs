@@ -11,7 +11,8 @@ public class BackupService
 
     private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
 
-    private int _order;   // manifest order and file number, shared by all phases
+    private int        _order;   // manifest order and file number, shared by all phases
+    private ScriptMode _mode;    // how scripts treat objects that already exist on the target
 
     public BackupService(ConnectionConfig cfg)
     {
@@ -25,8 +26,10 @@ public class BackupService
         List<DatabaseObject>      selectedObjects,
         int                       chunkSize,
         IProgress<BackupProgress> progress,
-        CancellationToken         ct)
+        CancellationToken         ct,
+        ScriptMode                mode = ScriptMode.DropAndCreate)
     {
+        _mode = mode;
         Directory.CreateDirectory(outputFolder);
 
         var manifest = new InstallManifest
@@ -253,7 +256,7 @@ public class BackupService
         {
             ct.ThrowIfCancellationRequested();
             progress.Report(new BackupProgress($"  > Scripting TRIGGER {trig.FullName}"));
-            sb.AppendLine(await _schema.ScriptTriggerAsync(trig));
+            sb.AppendLine(await _schema.ScriptModuleAsync(trig, _mode));
         }
         return sb.ToString();
     }
@@ -265,9 +268,8 @@ public class BackupService
     private Task<string> ScriptObjectAsync(DatabaseObject obj) => obj.Type switch
     {
         ObjectTypes.Table => _schema.ScriptTableAsync(obj),
-        ObjectTypes.View  => _schema.ScriptViewAsync(obj),
-        ObjectTypes.Func  => _schema.ScriptFuncAsync(obj),
-        ObjectTypes.Proc  => _schema.ScriptProcAsync(obj),
+        ObjectTypes.View or ObjectTypes.Func or ObjectTypes.Proc
+                          => _schema.ScriptModuleAsync(obj, _mode),
         _ => throw new NotSupportedException($"No scripter for object type {obj.Type}")
     };
 

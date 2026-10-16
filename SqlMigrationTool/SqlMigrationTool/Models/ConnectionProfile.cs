@@ -7,7 +7,7 @@ public class ConnectionProfile
     public int    Port        { get; set; }
     public bool   WindowsAuth { get; set; }
     public string Username    { get; set; } = "";
-    public string Password    { get; set; } = ""; // base64-encoded
+    public string Password    { get; set; } = ""; // DPAPI-encrypted ("dpapi:..."); see ProfileService
     public string Database    { get; set; } = "";
 
     public override string ToString() => Name;

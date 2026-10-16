@@ -16,6 +16,9 @@ public class frmBackup : Form
     private CheckBox        chkTriggers     = null!;
     private CheckedListBox  lstObjects      = null!;
     private NumericUpDown   nudChunkSize    = null!;
+    private ComboBox        cmbScriptMode   = null!;
+    private CheckBox        chkCleanupScript = null!;
+    private CheckBox        chkSecurity     = null!;
     private ListBox         lstLog          = null!;
     private ListView        lstSummary      = null!;
     private Label           lblStatus       = null!;
@@ -28,18 +31,6 @@ public class frmBackup : Form
 
     private readonly Dictionary<string, int[]>        _summaryData  = new(); // [total, success, failed]
     private readonly Dictionary<string, ListViewItem> _summaryItems = new();
-
-    private static readonly (string Type, string Label)[] SummaryRows =
-    {
-        ("TABLE",   "Tables"),
-        ("DATA",    "Data Files"),
-        ("VIEW",    "Views"),
-        ("PROC",    "Stored Procs"),
-        ("FUNC",    "Functions"),
-        ("TRIGGER", "Triggers"),
-        ("FK",      "Foreign Keys"),
-        ("INDEX",   "Indexes"),
-    };
 
     public frmBackup(ConnectionConfig cfg)
     {
@@ -128,25 +119,42 @@ public class frmBackup : Form
 
         // Type filter checkboxes
         content.Controls.Add(MakeLabel("Include:", 0, y + 2));
-        chkTables   = MakeTypeChk("Tables",    90,  y, "TABLE");
-        chkViews    = MakeTypeChk("Views",     200, y, "VIEW");
-        chkProcs    = MakeTypeChk("Procs",     290, y, "PROC");
-        chkFuncs    = MakeTypeChk("Functions", 380, y, "FUNC");
-        chkTriggers = MakeTypeChk("Triggers",  490, y, "TRIGGER");
+        chkTables   = MakeTypeChk("Tables",    90,  y, ObjectTypes.Table);
+        chkViews    = MakeTypeChk("Views",     200, y, ObjectTypes.View);
+        chkProcs    = MakeTypeChk("Procs",     290, y, ObjectTypes.Proc);
+        chkFuncs    = MakeTypeChk("Functions", 380, y, ObjectTypes.Func);
+        chkTriggers = MakeTypeChk("Triggers",  490, y, ObjectTypes.Trigger);
         content.Controls.AddRange(new Control[] { chkTables, chkViews, chkProcs, chkFuncs, chkTriggers });
-        y += 34;
+
+        // Opt-in: database users, roles and permissions (logins differ per server).
+        chkSecurity = new CheckBox
+        {
+            Text     = "Users, roles && permissions",   // && shows "&" (a single & marks a mnemonic)
+            Location = new Point(620, y),
+            AutoSize = true
+        };
+        content.Controls.Add(chkSecurity);
+        y += 26;
+
+        // Prerequisites have no checkbox: they are always exported, because the
+        // selected objects depend on them (e.g. procedures on table types).
+        content.Controls.Add(MakeLabel(
+            "Always included: schemas, data types, table types, sequences, synonyms, XML collections, " +
+            "partitions, extended properties, DB triggers",
+            90, y, Color.Gray));
+        y += 24;
 
         // Object list
         lstObjects = new CheckedListBox
         {
             Location       = new Point(0, y),
-            Size           = new Size(958, 220),
+            Size           = new Size(958, 204),
             CheckOnClick   = true,
             Font           = new Font("Consolas", 9),
             IntegralHeight = false
         };
         content.Controls.Add(lstObjects);
-        y += 228;
+        y += 212;
 
         // Chunk size
         content.Controls.Add(MakeLabel("Rows per file:", 0, y + 2));
@@ -160,6 +168,29 @@ public class frmBackup : Form
         };
         content.Controls.Add(nudChunkSize);
         content.Controls.Add(MakeLabel("(split large tables into chunks)", 210, y + 2, Color.Gray));
+
+        // Script mode: how the scripts treat objects that already exist on the target.
+        // Stored in the manifest as the default; the install screen can override it.
+        content.Controls.Add(MakeLabel("Script mode:", 470, y + 2));
+        cmbScriptMode = new ComboBox
+        {
+            Location      = new Point(560, y - 1),
+            Width         = 195,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        foreach (var mode in Enum.GetValues<ScriptMode>())
+            cmbScriptMode.Items.Add(new ScriptModeItem(mode));
+        cmbScriptMode.SelectedIndex = 0;   // DropAndCreate: the v1 behaviour
+        content.Controls.Add(cmbScriptMode);
+
+        // Optional cleanup (drop-all) script: written next to the backup, never run by the tool.
+        chkCleanupScript = new CheckBox
+        {
+            Text     = "Also write a cleanup script",
+            Location = new Point(768, y + 1),
+            AutoSize = true
+        };
+        content.Controls.Add(chkCleanupScript);
         y += 36;
 
         // Section headers
@@ -327,11 +358,11 @@ public class frmBackup : Form
                 int count = _allObjects.Count(o => o.Type == type);
                 chk.Text = type switch
                 {
-                    "TABLE"   => $"Tables ({count})",
-                    "VIEW"    => $"Views ({count})",
-                    "PROC"    => $"Procs ({count})",
-                    "FUNC"    => $"Functions ({count})",
-                    "TRIGGER" => $"Triggers ({count})",
+                    ObjectTypes.Table   => $"Tables ({count})",
+                    ObjectTypes.View    => $"Views ({count})",
+                    ObjectTypes.Proc    => $"Procs ({count})",
+                    ObjectTypes.Func    => $"Functions ({count})",
+                    ObjectTypes.Trigger => $"Triggers ({count})",
                     _         => chk.Text
                 };
             }
@@ -366,20 +397,25 @@ public class frmBackup : Form
         _summaryData.Clear();
         _summaryItems.Clear();
 
-        var hasTable   = selected.Any(o => o.Type == "TABLE");
-        var hasView    = selected.Any(o => o.Type == "VIEW");
-        var hasProc    = selected.Any(o => o.Type == "PROC");
-        var hasFunc    = selected.Any(o => o.Type == "FUNC");
-        var hasTrigger = selected.Any(o => o.Type == "TRIGGER");
+        var hasTable   = selected.Any(o => o.Type == ObjectTypes.Table);
+        var hasView    = selected.Any(o => o.Type == ObjectTypes.View);
+        var hasProc    = selected.Any(o => o.Type == ObjectTypes.Proc);
+        var hasFunc    = selected.Any(o => o.Type == ObjectTypes.Func);
+        var hasTrigger = selected.Any(o => o.Type == ObjectTypes.Trigger);
 
-        var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (hasTable)   { show.Add("TABLE"); show.Add("DATA"); show.Add("FK"); show.Add("INDEX"); }
-        if (hasView)    show.Add("VIEW");
-        if (hasProc)    show.Add("PROC");
-        if (hasFunc)    show.Add("FUNC");
-        if (hasTrigger) show.Add("TRIGGER");
+        // Prerequisites (schemas, types, sequences, synonyms) are always exported.
+        var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ObjectTypes.Schema, ObjectTypes.XmlSchema, ObjectTypes.DataType, ObjectTypes.TableType, ObjectTypes.Partition,
+            ObjectTypes.Sequence, ObjectTypes.Synonym, ObjectTypes.DbTrigger, ObjectTypes.ExtendedProperty
+        };
+        if (hasTable)   { show.Add(ObjectTypes.Table); show.Add(ObjectTypes.Data); show.Add(ObjectTypes.Fk); show.Add(ObjectTypes.Index); }
+        if (hasView)    show.Add(ObjectTypes.View);
+        if (hasProc)    show.Add(ObjectTypes.Proc);
+        if (hasFunc)    show.Add(ObjectTypes.Func);
+        if (hasTrigger) show.Add(ObjectTypes.Trigger);
 
-        foreach (var (type, label) in SummaryRows)
+        foreach (var (type, label) in ObjectTypes.SummaryRows)
         {
             if (!show.Contains(type)) continue;
 
@@ -457,7 +493,13 @@ public class frmBackup : Form
         try
         {
             var svc = new BackupService(_cfg);
-            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token);
+            var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
+            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token, new BackupOptions
+            {
+                Mode               = mode,
+                WriteCleanupScript = chkCleanupScript.Checked,
+                IncludeSecurity    = chkSecurity.Checked
+            });
 
             MessageBox.Show(
                 $"Backup complete!\n\nOutput folder:\n{folder}",

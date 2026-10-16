@@ -19,27 +19,19 @@ public class frmInstall : Form
     private Button     btnStart        = null!;
     private Button     btnAbort        = null!;
     private Button     btnBack         = null!;
+    private ComboBox   cmbScriptMode   = null!;
+    private ComboBox   cmbDataMode     = null!;
+    private CheckBox   chkPreview      = null!;
 
     private InstallManifest?          _manifest;
     private string                    _folder = "";
     private CancellationTokenSource?  _cts;
+    private bool                      _applyCompatibilityLevel;
+    private bool                      _matchCollation;
 
     private readonly Dictionary<ManifestEntry, ListViewItem> _itemMap      = new();
     private readonly Dictionary<string, int[]>               _summaryData  = new(); // [total, success, failed]
     private readonly Dictionary<string, ListViewItem>        _summaryItems = new();
-
-    // Fixed display order and labels for summary rows
-    private static readonly (string Type, string Label)[] SummaryRows =
-    {
-        ("TABLE",   "Tables"),
-        ("DATA",    "Data Files"),
-        ("VIEW",    "Views"),
-        ("PROC",    "Stored Procs"),
-        ("FUNC",    "Functions"),
-        ("TRIGGER", "Triggers"),
-        ("FK",      "Foreign Keys"),
-        ("INDEX",   "Indexes"),
-    };
 
     public frmInstall(ConnectionConfig cfg)
     {
@@ -143,6 +135,42 @@ public class frmInstall : Form
         btnLoad.FlatAppearance.BorderSize = 0;
         btnLoad.Click += BtnLoad_Click;
         content.Controls.Add(btnLoad);
+
+        // Script mode: preselected from the manifest; another choice re-wraps the
+        // scripts in memory at install time (the backup files are not changed).
+        content.Controls.Add(new Label { Text = "Script mode:", Location = new Point(140, y + 6), AutoSize = true });
+        cmbScriptMode = new ComboBox
+        {
+            Location      = new Point(230, y + 3),
+            Width         = 240,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Enabled       = false
+        };
+        foreach (var mode in Enum.GetValues<ScriptMode>())
+            cmbScriptMode.Items.Add(new ScriptModeItem(mode));
+        content.Controls.Add(cmbScriptMode);
+
+        // Data option: what to do when a table already has rows.
+        content.Controls.Add(new Label { Text = "Data:", Location = new Point(490, y + 6), AutoSize = true });
+        cmbDataMode = new ComboBox
+        {
+            Location      = new Point(530, y + 3),
+            Width         = 260,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        foreach (var dataMode in Enum.GetValues<DataLoadMode>())
+            cmbDataMode.Items.Add(new DataLoadModeItem(dataMode));
+        cmbDataMode.SelectedIndex = 0;   // Skip tables that have rows: never touches existing data
+        content.Controls.Add(cmbDataMode);
+
+        // Dry run: write the scripts as they would run to preview_install.sql, execute nothing.
+        chkPreview = new CheckBox
+        {
+            Text     = "Preview only",
+            Location = new Point(806, y + 5),
+            AutoSize = true
+        };
+        content.Controls.Add(chkPreview);
         y += 38;
 
         // Manifest info panel
@@ -286,7 +314,54 @@ public class frmInstall : Form
             txtFolder.Text = dlg.SelectedPath;
     }
 
-    private void BtnLoad_Click(object? sender, EventArgs e)
+    /// <summary>
+    /// Compares the target with the source (collation, compatibility level) and,
+    /// when the levels differ, asks whether to apply the source's level on install.
+    /// </summary>
+    private async Task CheckTargetAsync()
+    {
+        _applyCompatibilityLevel = false;
+        _matchCollation          = false;
+        try
+        {
+            var svc    = new InstallService(_cfg);
+            var target = await svc.GetTargetInfoAsync();
+            var notes  = InstallService.DescribeDifferences(_manifest!, target);
+            if (notes.Count == 0) return;
+
+            const string title = "Target database differs from the source";
+            var collationDiffers = _manifest!.DatabaseCollation is { } source && target.Collation is { } tc &&
+                                   !string.Equals(source, tc, StringComparison.OrdinalIgnoreCase);
+            var levelsDiffer     = _manifest.SqlCompatibilityLevel != target.CompatibilityLevel;
+
+            // An empty target can take the source's collation, so every column matches.
+            if (collationDiffers && await svc.IsTargetEmptyAsync())
+            {
+                _matchCollation = MessageBox.Show(
+                    $"The target database collation is {target.Collation}, the source's was {_manifest.DatabaseCollation}.\n\n" +
+                    "The target is empty, so its collation can be changed to match the source. Otherwise columns " +
+                    "without an explicit collation will use the target's, which can change sorting, comparisons " +
+                    $"and case sensitivity.\n\nChange the target database collation to {_manifest.DatabaseCollation} when installing?",
+                    title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+                notes.RemoveAt(0);   // the collation note, answered above
+            }
+
+            if (notes.Count == 0) return;
+            var text = string.Join("\n\n", notes);
+            if (levelsDiffer)
+                _applyCompatibilityLevel = MessageBox.Show(
+                    text + $"\n\nSet the target to compatibility level {Math.Min(_manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel)} when installing?",
+                    title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+            else
+                MessageBox.Show(text, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = $"Manifest loaded. Could not check the target: {ex.Message}";
+        }
+    }
+
+    private async void BtnLoad_Click(object? sender, EventArgs e)
     {
         _folder = txtFolder.Text.Trim();
         if (string.IsNullOrWhiteSpace(_folder))
@@ -302,9 +377,18 @@ public class frmInstall : Form
             PopulateProgressList();
             PopulateSummaryTable();
             ShowManifestInfo();
+
+            var backupMode = InstallService.ManifestMode(_manifest);
+            cmbScriptMode.SelectedIndex = cmbScriptMode.Items.Cast<ScriptModeItem>().ToList().FindIndex(i => i.Mode == backupMode);
+            cmbScriptMode.Enabled = true;
+            cmbDataMode.Enabled   = true;
+            chkPreview.Enabled    = true;
+
             btnStart.Enabled    = true;
             lblStatus.Text      = "Manifest loaded. Ready to install.";
             lblStatus.ForeColor = Color.DarkGreen;
+
+            await CheckTargetAsync();
         }
         catch (Exception ex)
         {
@@ -322,8 +406,9 @@ public class frmInstall : Form
         var totalFiles = _manifest.Phases.Sum(p => p.Files.Count);
         var s = _manifest.Summary;
         lblManifestInfo.Text =
-            $"✔ app_install.config.json found\r\n" +
-            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})\r\n" +
+            $"✔ app_install.config.json found  (backup format {_manifest.Version})\r\n" +
+            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})" +
+            (_manifest.DatabaseCollation is { } collation ? $"   Collation: {collation}" : "") + "\r\n" +
             $"Files:   {totalFiles} across {_manifest.Phases.Count} phases\r\n" +
             $"Tables:{s.TotalTables}  Views:{s.TotalViews}  Procs:{s.TotalProcedures}  Functions:{s.TotalFunctions}  DataFiles:{s.TotalDataFiles}";
 
@@ -405,7 +490,7 @@ public class frmInstall : Form
         _summaryData.Clear();
         _summaryItems.Clear();
 
-        foreach (var (type, label) in SummaryRows)
+        foreach (var (type, label) in ObjectTypes.SummaryRows)
         {
             if (!typeCounts.TryGetValue(type, out var total)) continue;
 
@@ -464,6 +549,9 @@ public class frmInstall : Form
 
         btnStart.Enabled  = false;
         btnLoad.Enabled   = false;
+        cmbScriptMode.Enabled = false;
+        cmbDataMode.Enabled   = false;
+        chkPreview.Enabled    = false;
         btnBack.Enabled   = false;
         btnAbort.Enabled  = true;
         progressBar.Value = 0;
@@ -494,6 +582,14 @@ public class frmInstall : Form
                     UpdateSummary(p.Entry.Type, success: true);
                     break;
 
+                case InstallStatus.Warning:   // installed; details in error.log
+                    item.Text             = "!";
+                    item.ForeColor        = Color.Orange;
+                    item.SubItems[4].Text = $"Warning: {p.Message[..Math.Min(p.Message.Length, 60)]}";
+                    progressBar.Value     = Math.Min(progressBar.Value + 1, progressBar.Maximum);
+                    UpdateSummary(p.Entry.Type, success: true);
+                    break;
+
                 case InstallStatus.Error:
                     item.Text             = "✘";
                     item.ForeColor        = Color.Red;
@@ -510,7 +606,25 @@ public class frmInstall : Form
         try
         {
             var svc = new InstallService(_cfg);
-            await svc.RunAsync(_folder, _manifest, progress, _cts.Token);
+            var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
+            var dataMode = ((DataLoadModeItem)cmbDataMode.SelectedItem!).Mode;
+
+            if (chkPreview.Checked)
+            {
+                var path = await svc.PreviewAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
+                MessageBox.Show($"Nothing was installed. The scripts as they would run were written to:\n\n{path}",
+                    "Preview written", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                lblStatus.Text      = $"Preview written: {InstallService.PreviewFileName} (nothing installed).";
+                lblStatus.ForeColor = Color.DarkGreen;
+                return;
+            }
+
+            if (_matchCollation && _manifest.DatabaseCollation is { } sourceCollation)
+                lblStatus.Text = await svc.ChangeCollationAsync(sourceCollation);
+            if (_applyCompatibilityLevel)
+                lblStatus.Text = await svc.ApplyCompatibilityLevelAsync(_manifest);
+
+            await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
 
             if (errorCount == 0)
             {
@@ -544,6 +658,9 @@ public class frmInstall : Form
         {
             btnStart.Enabled = true;
             btnLoad.Enabled  = true;
+            cmbScriptMode.Enabled = true;
+            cmbDataMode.Enabled   = true;
+            chkPreview.Enabled    = true;
             btnBack.Enabled  = true;
             btnAbort.Enabled = false;
             _cts?.Dispose();

@@ -37,6 +37,22 @@ public class ErrorLogger
         }
     }
 
+    public int WarningCount { get; private set; }
+
+    /// <summary>Warnings raised by a script that otherwise installed (e.g. column differences).</summary>
+    public void LogWarnings(ManifestEntry entry, IReadOnlyList<string> warnings)
+    {
+        lock (_lock)
+        {
+            WarningCount += warnings.Count;
+            var text = $"[{DateTime.Now:HH:mm:ss}] [WARNING] File: {entry.File}\n" +
+                       $"  Object: {entry.Object}\n" +
+                       string.Concat(warnings.Select(w => $"  - {w}\n")) +
+                       "  Action: Installed; review the items above.\n\n";
+            File.AppendAllText(_path, text);
+        }
+    }
+
     public void WriteSummary()
     {
         lock (_lock)
@@ -44,7 +60,7 @@ public class ErrorLogger
             var summary = $"""
 
                 ================================================================================
-                Summary: {ErrorCount} error(s) encountered. See entries above for details.
+                Summary: {ErrorCount} error(s), {WarningCount} warning(s). See entries above for details.
                 ================================================================================
                 """;
             File.AppendAllText(_path, summary);

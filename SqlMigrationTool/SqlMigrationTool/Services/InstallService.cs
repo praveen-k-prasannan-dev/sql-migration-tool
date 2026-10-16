@@ -15,38 +15,257 @@ public class InstallService
 
     public InstallService(ConnectionConfig cfg) => _cfg = cfg;
 
+    // ── Target checks ───────────────────────────────────────────────────────
+
+    public sealed record TargetInfo(string? Collation, int CompatibilityLevel, int MaxCompatibilityLevel);
+
+    /// <summary>Collation and compatibility level of the target database and the highest level its server supports.</summary>
+    public async Task<TargetInfo> GetTargetInfoAsync()
+    {
+        const string sql = @"
+            SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname),
+                   (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()),
+                   -- major version 10 (2008) -> 100 ... 16 (2022) -> 160
+                   CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) * 10";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+        await rdr.ReadAsync();
+        return new TargetInfo(rdr.IsDBNull(0) ? null : rdr.GetString(0), Convert.ToInt32(rdr.GetValue(1)), rdr.GetInt32(2));
+    }
+
+    /// <summary>Notes about the target that may change behaviour after install (collation, compatibility level).</summary>
+    public static List<string> DescribeDifferences(InstallManifest manifest, TargetInfo target)
+    {
+        var notes = new List<string>();
+        if (manifest.DatabaseCollation is { } source && target.Collation is { } tc &&
+            !string.Equals(source, tc, StringComparison.OrdinalIgnoreCase))
+        {
+            notes.Add($"The target database collation is {tc}, the source's was {source}. Columns without an " +
+                      "explicit collation will use the target's, which can change sorting, comparisons and case sensitivity.");
+        }
+        if (manifest.SqlCompatibilityLevel != target.CompatibilityLevel)
+        {
+            var level = Math.Min(manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel);
+            notes.Add($"The target database runs at compatibility level {target.CompatibilityLevel}, the source at " +
+                      $"{manifest.SqlCompatibilityLevel}." +
+                      (level != manifest.SqlCompatibilityLevel
+                          ? $" The target server supports at most {target.MaxCompatibilityLevel}."
+                          : ""));
+        }
+        return notes;
+    }
+
+    /// <summary>True when the target database holds no user objects, types or schemas yet.</summary>
+    public async Task<bool> IsTargetEmptyAsync()
+    {
+        const string sql = @"
+            SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.objects WHERE is_ms_shipped = 0)
+                          OR EXISTS (SELECT 1 FROM sys.types   WHERE is_user_defined = 1)
+                          OR EXISTS (SELECT 1 FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383)
+                        THEN 0 ELSE 1 END";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        return (int)(await cmd.ExecuteScalarAsync())! == 1;
+    }
+
+    /// <summary>
+    /// Changes the (empty) target database's collation, so columns without an explicit
+    /// collation get the source's. Needs brief exclusive access to the database.
+    /// </summary>
+    public async Task<string> ChangeCollationAsync(string collation)
+    {
+        if (!await IsTargetEmptyAsync())
+            return "Collation not changed: the target database is not empty.";
+
+        var master = new ConnectionConfig
+        {
+            Server = _cfg.Server, Port = _cfg.Port, WindowsAuth = _cfg.WindowsAuth,
+            Username = _cfg.Username, Password = _cfg.Password, Database = "master"
+        };
+        // The name comes from the backup's manifest: accept only a collation the server knows.
+        await using (var check = await SqlConnectionService.OpenAsync(master))
+        await using (var cmd0  = new SqlCommand("SELECT COUNT(*) FROM sys.fn_helpcollations() WHERE name = @c", check))
+        {
+            cmd0.Parameters.AddWithValue("@c", collation);
+            if ((int)(await cmd0.ExecuteScalarAsync())! == 0)
+                return $"Collation not changed: {collation} is not supported by this server.";
+        }
+
+        var db  = SqlNames.Quote(_cfg.Database);
+        var sql = $@"
+            ALTER DATABASE {db} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+            BEGIN TRY
+                ALTER DATABASE {db} COLLATE {collation};
+            END TRY
+            BEGIN CATCH
+                ALTER DATABASE {db} SET MULTI_USER;
+                THROW;
+            END CATCH;
+            ALTER DATABASE {db} SET MULTI_USER;";
+
+        // Pooled connections to the target would block SINGLE_USER.
+        SqlConnection.ClearAllPools();
+        await using var conn = await SqlConnectionService.OpenAsync(master);
+        await using var cmd  = new SqlCommand(sql, conn) { CommandTimeout = 300 };
+        await cmd.ExecuteNonQueryAsync();
+        return $"Target database collation changed to {collation}.";
+    }
+
+    /// <summary>
+    /// Sets the target database to the source's compatibility level, capped at the
+    /// highest level the target server supports. Returns what was done.
+    /// </summary>
+    public async Task<string> ApplyCompatibilityLevelAsync(InstallManifest manifest)
+    {
+        var target = await GetTargetInfoAsync();
+        var level  = Math.Min(manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel);
+        if (level == target.CompatibilityLevel)
+            return $"Compatibility level already {level}.";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(
+            $"DECLARE @sql nvarchar(400) = N'ALTER DATABASE ' + QUOTENAME(DB_NAME()) + N' SET COMPATIBILITY_LEVEL = {level}'; EXEC (@sql);", conn);
+        await cmd.ExecuteNonQueryAsync();
+        return $"Compatibility level changed from {target.CompatibilityLevel} to {level}" +
+               (level != manifest.SqlCompatibilityLevel ? $" (source {manifest.SqlCompatibilityLevel}; highest this server supports)." : ".");
+    }
+
+    /// <summary>A script as it will run: re-wrapped when a different mode was chosen.</summary>
+    private async Task<string> ReadScriptAsync(string filePath, CancellationToken ct)
+    {
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        return _rewrapTo is { } mode && ScriptWrapper.IsWrapped(content)
+            ? ScriptWrapper.Rewrap(content, mode)
+            : content;
+    }
+
+    public const string PreviewFileName = "preview_install.sql";
+
+    /// <summary>
+    /// Writes every script, exactly as the install would run it, to
+    /// preview_install.sql in the backup folder, and notes how each data file would
+    /// be loaded. Nothing is executed and the target is not contacted.
+    /// </summary>
+    public async Task<string> PreviewAsync(
+        string                     folder,
+        InstallManifest            manifest,
+        IProgress<InstallProgress> progress,
+        CancellationToken          ct,
+        ScriptMode?                mode     = null,
+        DataLoadMode               dataMode = DataLoadMode.SkipIfNotEmpty)
+    {
+        var effective = mode ?? ManifestMode(manifest);
+        _rewrapTo = effective != ManifestMode(manifest) ? effective : null;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine("-- SQL Migration Tool - INSTALL PREVIEW (nothing below has been executed)");
+        sb.AppendLine($"-- Backup:      {manifest.SourceServer} / {manifest.SourceDatabase} ({manifest.Created})");
+        sb.AppendLine($"-- Target:      {_cfg.Server} / {_cfg.Database}");
+        sb.AppendLine($"-- Script mode: {ScriptModeText.Label(effective)}");
+        sb.AppendLine($"-- Data:        {DataLoadModeText.Label(dataMode)}");
+        sb.AppendLine($"-- Generated:   {DateTime.Now:yyyy-MM-dd HH:mm}");
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine();
+
+        foreach (var phase in manifest.Phases)
+        {
+            sb.AppendLine($"-- ═══ Phase {phase.Phase}: {phase.Name} ═══");
+            sb.AppendLine();
+            foreach (var entry in phase.Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                progress.Report(new InstallProgress(entry, InstallStatus.Running));
+
+                if (entry.Type == ObjectTypes.Data)
+                {
+                    sb.AppendLine($"-- DATA {entry.Object}: {entry.File} ({entry.Rows:N0} rows) - loaded with \"{DataLoadModeText.Label(dataMode)}\"");
+                }
+                else
+                {
+                    sb.AppendLine($"-- ─── {entry.File} ───");
+                    sb.AppendLine((await ReadScriptAsync(Path.Combine(folder, entry.File.Replace('/', Path.DirectorySeparatorChar)), ct)).TrimEnd());
+                    sb.AppendLine();
+                }
+                progress.Report(new InstallProgress(entry, InstallStatus.Done));
+            }
+            sb.AppendLine();
+        }
+
+        var path = Path.Combine(folder, PreviewFileName);
+        await File.WriteAllTextAsync(path, sb.ToString(), ct);
+        return path;
+    }
+
     public async Task RunAsync(
         string                     folder,
         InstallManifest            manifest,
         IProgress<InstallProgress> progress,
-        CancellationToken          ct)
+        CancellationToken          ct,
+        ScriptMode?                mode     = null,
+        DataLoadMode               dataMode = DataLoadMode.SkipIfNotEmpty)
     {
         var logger = new ErrorLogger(folder);
+        var loader = new DataLoader(_cfg, dataMode);
+
+        // A mode other than the one the backup was written with: scripts are
+        // re-wrapped in memory before running; the backup files stay as they are.
+        _rewrapTo = mode is { } m && m != ManifestMode(manifest) ? m : null;
+
+        void Report(ManifestEntry entry, List<string> warnings)
+        {
+            if (warnings.Count == 0)
+            {
+                progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                return;
+            }
+            logger.LogWarnings(entry, warnings);
+            var more = warnings.Count > 1 ? $" (+{warnings.Count - 1} more, see error.log)" : "";
+            progress.Report(new InstallProgress(entry, InstallStatus.Warning, warnings[0] + more));
+        }
 
         foreach (var phase in manifest.Phases)
         {
-            foreach (var entry in phase.Files)
+            var dataEntries = phase.Files.Where(f => f.Type == ObjectTypes.Data).ToList();
+            if (dataEntries.Count > 0)
+                await loader.BeginPhaseAsync(dataEntries.Select(f => f.Object), ct);
+
+            try
             {
-                ct.ThrowIfCancellationRequested();
-
-                progress.Report(new InstallProgress(entry, InstallStatus.Running));
-                try
+                foreach (var entry in phase.Files)
                 {
-                    var fullPath = Path.Combine(folder,
-                        entry.File.Replace('/', Path.DirectorySeparatorChar));
+                    ct.ThrowIfCancellationRequested();
 
-                    if (entry.Type == "DATA")
-                        await InsertDataFileAsync(fullPath, ct);
-                    else
-                        await ExecuteSqlFileAsync(fullPath, ct);
+                    progress.Report(new InstallProgress(entry, InstallStatus.Running));
+                    try
+                    {
+                        var fullPath = Path.Combine(folder,
+                            entry.File.Replace('/', Path.DirectorySeparatorChar));
 
-                    progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                        Report(entry, entry.Type == ObjectTypes.Data
+                            ? await loader.LoadChunkAsync(fullPath, ct)
+                            : await ExecuteSqlFileAsync(fullPath, ct));
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        logger.Log(entry, ex);
+                        progress.Report(new InstallProgress(entry, InstallStatus.Error, ex.Message));
+                    }
                 }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+            }
+            finally
+            {
+                // Foreign keys and triggers switched off for the load come back on,
+                // even after a cancel; problems are reported on the last data file.
+                if (dataEntries.Count > 0)
                 {
-                    logger.Log(entry, ex);
-                    progress.Report(new InstallProgress(entry, InstallStatus.Error, ex.Message));
+                    var problems = await loader.EndPhaseAsync();
+                    if (problems.Count > 0)
+                        Report(dataEntries[^1], problems);
                 }
             }
         }
@@ -54,174 +273,62 @@ public class InstallService
         logger.WriteSummary();
     }
 
-    private async Task ExecuteSqlFileAsync(string filePath, CancellationToken ct)
-    {
-        var content = await File.ReadAllTextAsync(filePath, ct);
+    /// <summary>The script mode a backup was written with (DropAndCreate for v1 backups).</summary>
+    public static ScriptMode ManifestMode(InstallManifest manifest) =>
+        Enum.TryParse<ScriptMode>(manifest.ScriptMode, ignoreCase: true, out var m) ? m : ScriptMode.DropAndCreate;
 
-        // Split on GO batch separator (SQL Server Management Studio directive)
-        var batches = content.Split(
-            new[] { "\nGO\n", "\nGO\r\n", "\r\nGO\r\n", "\r\nGO\n", "\nGO", "\r\nGO" },
-            StringSplitOptions.RemoveEmptyEntries);
+    private ScriptMode? _rewrapTo;
+
+    /// <summary>Runs a script; returns the warnings it raised (RAISERROR severity <= 10).</summary>
+    private async Task<List<string>> ExecuteSqlFileAsync(string filePath, CancellationToken ct)
+    {
+        var content = await ReadScriptAsync(filePath, ct);
+
+        var batches = BatchSplitter.Split(content);
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
+        // Informational RAISERRORs from generated scripts (number 50000) are warnings,
+        // e.g. CreateOrAlter column differences. Server chatter has other numbers.
+        var warnings = new List<string>();
+        conn.InfoMessage += (_, e) =>
+        {
+            foreach (SqlError err in e.Errors)
+                if (err.Number == 50000) warnings.Add(err.Message);
+        };
+
+        // Files such as indexes.sql hold many independent objects: a failing batch
+        // must not stop the rest. Errors are collected and reported together.
+        var errors = new List<string>();
+        int executed = 0;
         foreach (var batch in batches)
         {
             ct.ThrowIfCancellationRequested();
             var trimmed = batch.Trim();
             if (string.IsNullOrWhiteSpace(trimmed)) continue;
 
+            executed++;
             await using var cmd = new SqlCommand(trimmed, conn)
             {
                 CommandTimeout = 300
             };
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-    }
-
-    private async Task InsertDataFileAsync(string filePath, CancellationToken ct)
-    {
-        var json  = await File.ReadAllTextAsync(filePath, ct);
-        var chunk = JsonSerializer.Deserialize<DataChunk>(json, _jsonOptions);
-        if (chunk is null || chunk.Rows.Count == 0) return;
-
-        var schemaParts = chunk.Table.Split('.', 2);
-        var schema      = schemaParts.Length == 2 ? schemaParts[0] : "dbo";
-        var table       = schemaParts.Length == 2 ? schemaParts[1] : schemaParts[0];
-
-        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-
-        var hasIdentity = await HasIdentityColumnAsync(conn, schema, table, ct);
-        var colTypes    = await GetColumnTypesAsync(conn, schema, table, chunk.Columns, ct);
-
-        var colList   = string.Join(", ", chunk.Columns.Select(c => $"[{c}]"));
-        var paramList = string.Join(", ", chunk.Columns.Select((_, i) => $"@p{i}"));
-        var insertSql = $"INSERT INTO [{schema}].[{table}] ({colList}) VALUES ({paramList})";
-
-        await using var tran = conn.BeginTransaction();
-        try
-        {
-            if (hasIdentity)
+            try
             {
-                await using var onCmd = new SqlCommand(
-                    $"SET IDENTITY_INSERT [{schema}].[{table}] ON", conn, tran);
-                await onCmd.ExecuteNonQueryAsync(ct);
-            }
-
-            await using var cmd = new SqlCommand(insertSql, conn, tran);
-            for (int i = 0; i < chunk.Columns.Count; i++)
-                cmd.Parameters.Add(new SqlParameter($"@p{i}", DBNull.Value));
-
-            foreach (var row in chunk.Rows)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                for (int i = 0; i < chunk.Columns.Count; i++)
-                {
-                    var raw     = i < row.Length ? row[i] : null;
-                    var sqlType = i < colTypes.Count ? colTypes[i] : null;
-                    var val     = raw is JsonElement je
-                        ? ConvertJsonElement(je, sqlType)
-                        : raw;
-                    cmd.Parameters[$"@p{i}"].Value = val ?? (object)DBNull.Value;
-                }
                 await cmd.ExecuteNonQueryAsync(ct);
             }
-
-            if (hasIdentity)
+            catch (SqlException ex)
             {
-                await using var offCmd = new SqlCommand(
-                    $"SET IDENTITY_INSERT [{schema}].[{table}] OFF", conn, tran);
-                await offCmd.ExecuteNonQueryAsync(ct);
+                errors.Add(ex.Message);
             }
-
-            await tran.CommitAsync(ct);
-        }
-        catch
-        {
-            await tran.RollbackAsync(CancellationToken.None);
-            throw;
-        }
-    }
-
-    private static async Task<bool> HasIdentityColumnAsync(
-        SqlConnection conn, string schema, string table, CancellationToken ct)
-    {
-        const string sql = @"
-            SELECT COUNT(*) FROM sys.columns
-            WHERE object_id = OBJECT_ID(@fqn) AND is_identity = 1";
-
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return Convert.ToInt32(result) > 0;
-    }
-
-    private static async Task<List<string?>> GetColumnTypesAsync(
-        SqlConnection conn, string schema, string table,
-        List<string> columns, CancellationToken ct)
-    {
-        const string sql = @"
-            SELECT c.name, t.name
-            FROM sys.columns c
-            JOIN sys.types t ON c.user_type_id = t.user_type_id
-            WHERE c.object_id = OBJECT_ID(@fqn)";
-
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
-
-        var typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        await using var rdr = await cmd.ExecuteReaderAsync(ct);
-        while (await rdr.ReadAsync())
-            typeMap[rdr.GetString(0)] = rdr.GetString(1).ToUpper();
-
-        return columns.Select(c => typeMap.TryGetValue(c, out var t) ? t : (string?)null).ToList();
-    }
-
-    private static object? ConvertJsonElement(JsonElement el, string? sqlType = null)
-    {
-        return el.ValueKind switch
-        {
-            JsonValueKind.Null    => null,
-            JsonValueKind.True    => true,
-            JsonValueKind.False   => false,
-            JsonValueKind.Number  => el.TryGetInt64(out var l)  ? l
-                                   : el.TryGetDouble(out var d) ? d
-                                   : (object?)el.GetDecimal(),
-            JsonValueKind.String  => ConvertStringValue(el.GetString(), sqlType),
-            _                     => el.ToString()
-        };
-    }
-
-    private static object? ConvertStringValue(string? s, string? sqlType)
-    {
-        if (s is null) return null;
-
-        switch (sqlType)
-        {
-            case "IMAGE" or "VARBINARY" or "BINARY" or "TIMESTAMP" or "ROWVERSION":
-                try { return Convert.FromBase64String(s); }
-                catch { return s; }
-
-            case "DATETIME" or "DATETIME2" or "SMALLDATETIME" or "DATE":
-                if (DateTime.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var dt))
-                    return dt;
-                break;
-
-            case "DATETIMEOFFSET":
-                if (DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var dto))
-                    return dto;
-                break;
-
-            case "TIME":
-                if (TimeSpan.TryParse(s, out var ts))
-                    return ts;
-                break;
         }
 
-        return s;
+        if (errors.Count == 1)
+            throw new InvalidOperationException(errors[0]);
+        if (errors.Count > 1)
+            throw new InvalidOperationException(
+                $"{errors.Count} of {executed} statements failed: " + string.Join(" | ", errors));
+
+        return warnings;
     }
 
     public static InstallManifest LoadManifest(string folder)
@@ -231,7 +338,16 @@ public class InstallService
             throw new FileNotFoundException("app_install.config.json not found in the selected folder.", path);
 
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<InstallManifest>(json, _jsonOptions)
+        var manifest = JsonSerializer.Deserialize<InstallManifest>(json, _jsonOptions)
             ?? throw new InvalidDataException("Failed to parse app_install.config.json");
+
+        // Newer manifests may contain object types or phases this build cannot install correctly.
+        var major = int.TryParse(manifest.Version.Split('.')[0], out var m) ? m : 0;
+        if (major < 1 || major > InstallManifest.CurrentMajorVersion)
+            throw new InvalidDataException(
+                $"This backup uses manifest version {manifest.Version}, which this version of SQL Migration Tool " +
+                $"cannot install (supported: 1.x - {InstallManifest.CurrentMajorVersion}.x). Please update the tool.");
+
+        return manifest;
     }
 }

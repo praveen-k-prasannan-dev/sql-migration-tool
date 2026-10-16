@@ -483,6 +483,120 @@ public class SchemaExporter
         return count == 0 ? null : sb.ToString();
     }
 
+    /// <summary>
+    /// Extended properties (e.g. MS_Description) on the database, schemas, objects,
+    /// columns, parameters, constraints, triggers, indexes and types, written as
+    /// update-or-add so a re-run is safe; null when there are none.
+    /// </summary>
+    public async Task<string?> ScriptExtendedPropertiesAsync()
+    {
+        const string sql = @"
+            SELECT ep.class, ep.name,
+                   CAST(ep.value AS nvarchar(4000))                      AS Value,
+                   CAST(SQL_VARIANT_PROPERTY(ep.value, 'BaseType') AS sysname) AS BaseType,
+                   SCHEMA_NAME(o.schema_id) AS ObjSchema, o.name AS ObjName, o.type AS ObjType,
+                   po.name AS ParentName, po.type AS ParentType,
+                   CASE WHEN ep.class = 1 AND ep.minor_id > 0 THEN COL_NAME(ep.major_id, ep.minor_id) END AS ColumnName,
+                   (SELECT p.name FROM sys.parameters p
+                    WHERE ep.class = 2 AND p.object_id = ep.major_id AND p.parameter_id = ep.minor_id) AS ParamName,
+                   (SELECT i.name FROM sys.indexes i
+                    WHERE ep.class = 7 AND i.object_id = ep.major_id AND i.index_id = ep.minor_id) AS IndexName,
+                   CASE WHEN ep.class = 3 THEN SCHEMA_NAME(ep.major_id) END AS SchemaName,
+                   (SELECT SCHEMA_NAME(t.schema_id) FROM sys.types t WHERE ep.class = 6 AND t.user_type_id = ep.major_id) AS TypeSchema,
+                   (SELECT t.name FROM sys.types t WHERE ep.class = 6 AND t.user_type_id = ep.major_id)                   AS TypeName
+            FROM sys.extended_properties ep
+            LEFT JOIN sys.objects o  ON ep.class IN (1, 2, 7) AND o.object_id = ep.major_id
+            LEFT JOIN sys.objects po ON po.object_id = o.parent_object_id
+            WHERE ep.class IN (0, 1, 2, 3, 6, 7)
+              AND ISNULL(o.is_ms_shipped, 0) = 0
+            ORDER BY ep.class, ObjSchema, ObjName, ColumnName, ParamName, IndexName, ep.name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        static string? LevelType(string? objType) => objType?.Trim() switch
+        {
+            "U"                                => "TABLE",
+            "V"                                => "VIEW",
+            "P"                                => "PROCEDURE",
+            "FN" or "IF" or "TF" or "FS" or "FT" => "FUNCTION",
+            "SN"                               => "SYNONYM",
+            "SO"                               => "SEQUENCE",
+            _                                  => null
+        };
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Extended properties");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            string? Str(string col) => rdr[col] is DBNull ? null : Convert.ToString(rdr[col]);
+
+            // (level type, level name) pairs, outermost first.
+            var levels = new List<(string type, string name)>();
+            switch (Convert.ToInt32(rdr["class"]))
+            {
+                case 0:   // database
+                    break;
+                case 3:   // schema
+                    levels.Add(("SCHEMA", Str("SchemaName")!));
+                    break;
+                case 6:   // user-defined type
+                    levels.Add(("SCHEMA", Str("TypeSchema")!));
+                    levels.Add(("TYPE",   Str("TypeName")!));
+                    break;
+                default:  // 1 object/column, 2 parameter, 7 index
+                {
+                    var objType = Str("ObjType")?.Trim();
+                    levels.Add(("SCHEMA", Str("ObjSchema")!));
+                    if (objType is "C" or "D" or "F" or "PK" or "UQ" or "TR")
+                    {
+                        // constraints and triggers hang off their table or view
+                        var parentType = LevelType(Str("ParentType"));
+                        if (parentType is null) continue;
+                        levels.Add((parentType, Str("ParentName")!));
+                        levels.Add((objType == "TR" ? "TRIGGER" : "CONSTRAINT", Str("ObjName")!));
+                    }
+                    else
+                    {
+                        var levelType = LevelType(objType);
+                        if (levelType is null) continue;
+                        levels.Add((levelType, Str("ObjName")!));
+                        if (Str("ColumnName") is { } col)   levels.Add(("COLUMN",    col));
+                        if (Str("ParamName")  is { } param) levels.Add(("PARAMETER", param));
+                        if (Str("IndexName")  is { } index) levels.Add(("INDEX",     index));
+                    }
+                    break;
+                }
+            }
+
+            var name  = SqlNames.Literal(Str("name")!);
+            var raw   = Str("Value");
+            var value = raw is null ? "NULL"
+                      : Str("BaseType") is "int" or "bigint" or "smallint" or "tinyint" or "bit"
+                                        or "decimal" or "numeric" or "float" or "real"
+                        ? raw
+                        : SqlNames.Literal(raw);
+
+            // fn_listextendedproperty takes all six level arguments; unused ones are NULL.
+            var fnArgs = string.Join(", ", Enumerable.Range(0, 3).SelectMany(i => i < levels.Count
+                ? new[] { SqlNames.Literal(levels[i].type), SqlNames.Literal(levels[i].name) }
+                : new[] { "NULL", "NULL" }));
+            var procArgs = string.Concat(levels.Select((l, i) =>
+                $", @level{i}type = {SqlNames.Literal(l.type)}, @level{i}name = {SqlNames.Literal(l.name)}"));
+
+            sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.fn_listextendedproperty({name}, {fnArgs}))");
+            sb.AppendLine($"    EXEC sys.sp_updateextendedproperty @name = {name}, @value = {value}{procArgs};");
+            sb.AppendLine("ELSE");
+            sb.AppendLine($"    EXEC sys.sp_addextendedproperty @name = {name}, @value = {value}{procArgs};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"

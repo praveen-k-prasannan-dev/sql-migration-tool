@@ -272,10 +272,16 @@ public sealed class DbSnapshot
                        WHEN 0 THEN 'DATABASE'
                        WHEN 1 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id)
                                    + CASE WHEN ep.minor_id > 0 THEN '.' + ISNULL(COL_NAME(ep.major_id, ep.minor_id), '?') ELSE '' END
+                       WHEN 2 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id) + '.'
+                                   + (SELECT p.name FROM sys.parameters p WHERE p.object_id = ep.major_id AND p.parameter_id = ep.minor_id)
                        WHEN 3 THEN SCHEMA_NAME(ep.major_id)
+                       WHEN 6 THEN (SELECT SCHEMA_NAME(t.schema_id) + '.' + t.name FROM sys.types t WHERE t.user_type_id = ep.major_id)
+                       WHEN 7 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id) + '.'
+                                   + (SELECT i.name FROM sys.indexes i WHERE i.object_id = ep.major_id AND i.index_id = ep.minor_id)
                        ELSE CAST(ep.major_id AS varchar(20)) + '/' + CAST(ep.minor_id AS varchar(20))
                    END,
-                   ep.name, CAST(ep.value AS nvarchar(4000))
+                   ep.name, CAST(ep.value AS nvarchar(4000)),
+                   CAST(SQL_VARIANT_PROPERTY(ep.value, 'BaseType') AS sysname)
             FROM sys.extended_properties ep
             """),
 

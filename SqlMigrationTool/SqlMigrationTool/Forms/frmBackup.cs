@@ -364,7 +364,7 @@ public class frmBackup : Form
         var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             ObjectTypes.Schema, ObjectTypes.DataType, ObjectTypes.TableType,
-            ObjectTypes.Sequence, ObjectTypes.Synonym, ObjectTypes.DbTrigger
+            ObjectTypes.Sequence, ObjectTypes.Synonym, ObjectTypes.DbTrigger, ObjectTypes.ExtendedProperty
         };
         if (hasTable)   { show.Add(ObjectTypes.Table); show.Add(ObjectTypes.Data); show.Add(ObjectTypes.Fk); show.Add(ObjectTypes.Index); }
         if (hasView)    show.Add(ObjectTypes.View);

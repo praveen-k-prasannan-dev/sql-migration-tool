@@ -171,6 +171,7 @@ public class BackupService
             new(ObjectTypes.Index,    "indexes",          "Indexes",            async () => await _schema.ScriptIndexesAsync()),
             new(ObjectTypes.Trigger,  "triggers",         "Triggers",           () => ScriptTriggersAsync(triggers, progress, ct)),
             new(ObjectTypes.Sequence, "sequence_restart", "Sequence positions", _schema.ScriptSequenceRestartsAsync),
+            new(ObjectTypes.ExtendedProperty, "extended_properties", "Extended properties", _schema.ScriptExtendedPropertiesAsync),
             // Last: DDL triggers fire on (and can block) any schema change made after them.
             new(ObjectTypes.DbTrigger, "database_triggers", "Database triggers", _schema.ScriptDatabaseTriggersAsync),
         }, progress, ct);

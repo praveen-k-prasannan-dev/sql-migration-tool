@@ -21,6 +21,7 @@ public static class ObjectTypes
     public const string Sequence  = "SEQUENCE";
     public const string Synonym   = "SYNONYM";
     public const string DbTrigger = "DBTRIGGER";
+    public const string ExtendedProperty = "EXTPROP";
 
     /// <summary>Display order and labels for the backup/install summary grids.</summary>
     public static readonly (string Type, string Label)[] SummaryRows =
@@ -37,6 +38,7 @@ public static class ObjectTypes
         (Func,    "Functions"),
         (Trigger, "Triggers"),
         (DbTrigger, "Database Triggers"),
+        (ExtendedProperty, "Extended Properties"),
         (Fk,      "Foreign Keys"),
         (Index,   "Indexes"),
     };

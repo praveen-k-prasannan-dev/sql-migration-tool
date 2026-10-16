@@ -297,6 +297,21 @@ EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Display na
      @level1type = N'TABLE',  @level1name = N'Customer',
      @level2type = N'COLUMN', @level2name = N'Name';
 GO
+EXEC sys.sp_addextendedproperty @name = N'Owner',     @value = N'Data team';                           -- database
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Sales objects',
+     @level0type = N'SCHEMA', @level0name = N'Sales';                                                  -- schema
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Order lines to save',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'PROCEDURE', @level1name = N'uspSaveOrderLines',
+     @level2type = N'PARAMETER', @level2name = N'@Lines';                                              -- parameter
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Codes are 3+ chars',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'Customer',
+     @level2type = N'CONSTRAINT', @level2name = N'CK_Customer_Code';                                   -- constraint
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Lookup by e-mail',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'Customer',
+     @level2type = N'INDEX', @level2name = N'IX_Customer_Email';                                       -- index
+EXEC sys.sp_addextendedproperty @name = N'Version',  @value = 3,
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TYPE', @level1name = N'OrderLineTVP'; -- type, int value
+GO
 
 -- ── Security ─────────────────────────────────────────────────────────────────
 CREATE ROLE SalesReader;

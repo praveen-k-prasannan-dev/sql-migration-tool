@@ -129,24 +129,32 @@ public class frmBackup : Form
         // Opt-in: database users, roles and permissions (logins differ per server).
         chkSecurity = new CheckBox
         {
-            Text     = "Users, roles & permissions",
+            Text     = "Users, roles && permissions",   // && shows "&" (a single & marks a mnemonic)
             Location = new Point(620, y),
             AutoSize = true
         };
         content.Controls.Add(chkSecurity);
-        y += 34;
+        y += 26;
+
+        // Prerequisites have no checkbox: they are always exported, because the
+        // selected objects depend on them (e.g. procedures on table types).
+        content.Controls.Add(MakeLabel(
+            "Always included: schemas, data types, table types, sequences, synonyms, XML collections, " +
+            "partitions, extended properties, DB triggers",
+            90, y, Color.Gray));
+        y += 24;
 
         // Object list
         lstObjects = new CheckedListBox
         {
             Location       = new Point(0, y),
-            Size           = new Size(958, 220),
+            Size           = new Size(958, 204),
             CheckOnClick   = true,
             Font           = new Font("Consolas", 9),
             IntegralHeight = false
         };
         content.Controls.Add(lstObjects);
-        y += 228;
+        y += 212;
 
         // Chunk size
         content.Controls.Add(MakeLabel("Rows per file:", 0, y + 2));

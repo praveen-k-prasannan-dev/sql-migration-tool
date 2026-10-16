@@ -28,8 +28,13 @@ public static class TestDatabase
             CREATE DATABASE [{quoted}];
             """;
 
+        // Our own pooled connections to the database would block the drop.
+        SqlConnection.ClearAllPools();
+
+        // Generous timeout: SINGLE_USER can wait a long time on locks held by
+        // background tasks or other tools (e.g. SSMS Object Explorer).
         await using var conn = await SqlConnectionService.OpenAsync(o.Config("master"));
-        await using var cmd  = new SqlCommand(sql, conn) { CommandTimeout = 120 };
+        await using var cmd  = new SqlCommand(sql, conn) { CommandTimeout = 600 };
         cmd.Parameters.AddWithValue("@db", database);
         await cmd.ExecuteNonQueryAsync();
     }

@@ -126,8 +126,11 @@ CREATE TABLE dbo.HeapLog
     Msg       NVARCHAR(MAX)    NULL,
     Payload   VARBINARY(MAX)   NULL,
     RowGuid   UNIQUEIDENTIFIER ROWGUIDCOL NOT NULL CONSTRAINT DF_HeapLog_RowGuid DEFAULT (NEWID()),
-    SparseCol INT SPARSE NULL
+    SparseCol INT SPARSE NULL,
+    CONSTRAINT CK_HeapLog_Sparse CHECK (SparseCol > 0)
 );
+GO
+ALTER TABLE dbo.HeapLog NOCHECK CONSTRAINT CK_HeapLog_Sparse;   -- disabled CHECK
 GO
 
 -- Identity with non-default seed; index name shared with dbo.Customer.

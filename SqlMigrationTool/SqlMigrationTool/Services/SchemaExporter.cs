@@ -111,32 +111,26 @@ public class SchemaExporter
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
         var objectId = await GetObjectIdAsync(conn, tbl.Schema, tbl.Name);
-        var columns  = await GetColumnDefsAsync(conn, objectId, forTableType: false);
-        var pkCols  = await GetPrimaryKeyColsAsync(conn, tbl.Schema, tbl.Name);
-        var pkName  = await GetPrimaryKeyNameAsync(conn, tbl.Schema, tbl.Name);
+        var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
+        var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
+        lines.AddRange(constraints);
 
+        var name = SqlNames.Quote(tbl.Schema, tbl.Name);
         var sb = new StringBuilder();
         sb.AppendLine($"-- Table: {tbl.FullName}");
-        sb.AppendLine($"IF OBJECT_ID(N'[{tbl.Schema}].[{tbl.Name}]','U') IS NOT NULL");
-        sb.AppendLine($"    DROP TABLE [{tbl.Schema}].[{tbl.Name}]");
+        sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)},'U') IS NOT NULL");
+        sb.AppendLine($"    DROP TABLE {name}");
         sb.AppendLine("GO");
-        sb.AppendLine($"CREATE TABLE [{tbl.Schema}].[{tbl.Name}] (");
-
-        for (int i = 0; i < columns.Count; i++)
-        {
-            var col  = columns[i];
-            var comma = (i < columns.Count - 1 || pkCols.Count > 0) ? "," : "";
-            sb.AppendLine($"    {col}{comma}");
-        }
-
-        if (pkCols.Count > 0 && !string.IsNullOrEmpty(pkName))
-        {
-            var pkColList = string.Join(", ", pkCols.Select(c => $"[{c}]"));
-            sb.AppendLine($"    CONSTRAINT [{pkName}] PRIMARY KEY CLUSTERED ({pkColList})");
-        }
-
+        sb.AppendLine($"CREATE TABLE {name} (");
+        sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
         sb.AppendLine(")");
         sb.AppendLine("GO");
+
+        foreach (var check in disabledChecks)
+        {
+            sb.AppendLine($"ALTER TABLE {name} NOCHECK CONSTRAINT {SqlNames.Quote(check)}");
+            sb.AppendLine("GO");
+        }
         return sb.ToString();
     }
 
@@ -633,43 +627,55 @@ public class SchemaExporter
             : throw new InvalidOperationException($"Object {schema}.{name} not found.");
     }
 
-    private static async Task<List<string>> GetPrimaryKeyColsAsync(
-        SqlConnection conn, string schema, string table)
+    /// <summary>
+    /// PRIMARY KEY, UNIQUE and CHECK constraint lines for CREATE TABLE, plus the
+    /// names of CHECK constraints that are disabled in the source.
+    /// </summary>
+    private static async Task<(List<string> lines, List<string> disabledChecks)> GetTableConstraintsAsync(
+        SqlConnection conn, int objectId)
     {
         const string sql = @"
-            SELECT c.COLUMN_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
-                ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-               AND tc.TABLE_SCHEMA    = c.TABLE_SCHEMA
-               AND tc.TABLE_NAME      = c.TABLE_NAME
-            WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-              AND tc.TABLE_SCHEMA = @schema AND tc.TABLE_NAME = @table
-            ORDER BY c.ORDINAL_POSITION";
+            SELECT k.type, k.name, k.is_system_named, i.index_id, i.type_desc, NULL, 0,
+                   CASE k.type WHEN 'PK' THEN 0 ELSE 1 END AS SortKey
+            FROM sys.key_constraints k
+            JOIN sys.indexes i ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id
+            WHERE k.parent_object_id = @id
+            UNION ALL
+            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition, cc.is_disabled, 2
+            FROM sys.check_constraints cc
+            WHERE cc.parent_object_id = @id
+            ORDER BY SortKey, 2";   // PK, UQ, then CHECK
+
+        var keyColumns = await GetIndexKeyColumnsAsync(conn, objectId);
 
         await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
-
-        var cols = new List<string>();
+        cmd.Parameters.AddWithValue("@id", objectId);
         await using var rdr = await cmd.ExecuteReaderAsync();
-        while (await rdr.ReadAsync()) cols.Add(rdr.GetString(0));
-        return cols;
-    }
 
-    private static async Task<string?> GetPrimaryKeyNameAsync(
-        SqlConnection conn, string schema, string table)
-    {
-        const string sql = @"
-            SELECT CONSTRAINT_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
-            WHERE CONSTRAINT_TYPE = 'PRIMARY KEY'
-              AND TABLE_SCHEMA = @schema AND TABLE_NAME = @table";
+        var lines    = new List<string>();
+        var disabled = new List<string>();
+        while (await rdr.ReadAsync())
+        {
+            var kind   = rdr.GetString(0).Trim();
+            var name   = rdr.GetString(1);
+            var prefix = rdr.GetBoolean(2) ? "" : $"CONSTRAINT {SqlNames.Quote(name)} ";
 
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
-        return (string?)await cmd.ExecuteScalarAsync();
+            switch (kind)
+            {
+                case "PK":
+                    lines.Add($"{prefix}PRIMARY KEY {rdr.GetString(4)} ({keyColumns[rdr.GetInt32(3)]})");
+                    break;
+                case "UQ":
+                    lines.Add($"{prefix}UNIQUE {rdr.GetString(4)} ({keyColumns[rdr.GetInt32(3)]})");
+                    break;
+                default:
+                    lines.Add($"{prefix}CHECK {rdr.GetString(5)}");
+                    // A system-named constraint gets a new name on the target, so it cannot be addressed.
+                    if (Convert.ToBoolean(rdr.GetValue(6)) && !rdr.GetBoolean(2)) disabled.Add(name);
+                    break;
+            }
+        }
+        return (lines, disabled);
     }
 
     public async Task<int> GetCompatibilityLevelAsync()

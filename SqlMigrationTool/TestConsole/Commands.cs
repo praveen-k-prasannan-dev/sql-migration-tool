@@ -24,7 +24,7 @@ public static class Commands
         await TestDatabase.RecreateAsync(o, o.TargetDb);
 
         // ── Backup ──────────────────────────────────────────────────────────
-        var source  = o.Config(o.SourceDb);
+        var source  = o.SourceConfig();
         var objects = await new SchemaExporter(source).ListAllObjectsAsync();
         Out.Step($"Backing up {objects.Count} objects "
                + $"({string.Join(", ", objects.GroupBy(x => x.Type).Select(g => $"{g.Key} {g.Count()}"))})");
@@ -105,6 +105,8 @@ public static class Commands
         var installer = new InstallService(o.Config(o.TargetDb));
         foreach (var note in InstallService.DescribeDifferences(manifest, await installer.GetTargetInfoAsync()))
             Out.Warn($"  NOTE: {note}");
+        if (o.MatchCollation && manifest.DatabaseCollation is { } collation)
+            Out.Info($"  {await installer.ChangeCollationAsync(collation)}");
         if (o.ApplyCompat)
             Out.Info($"  {await installer.ApplyCompatibilityLevelAsync(manifest)}");
         await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None, o.InstallMode, o.DataMode);
@@ -118,7 +120,7 @@ public static class Commands
     /// </summary>
     public static async Task<int> RewrapCheckAsync(Options o)
     {
-        var source  = o.Config(o.SourceDb);
+        var source  = o.SourceConfig();
         var objects = await new SchemaExporter(source).ListAllObjectsAsync();
         var root    = Path.Combine(Path.GetTempPath(), "SqlMigTest", "rewrap_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
         var modes   = Enum.GetValues<ScriptMode>();
@@ -160,7 +162,7 @@ public static class Commands
     private static async Task<int> CompareCoreAsync(Options o)
     {
         Out.Step($"Comparing {o.SourceDb} → {o.TargetDb}");
-        var src = await DbSnapshot.CaptureAsync(o.Config(o.SourceDb));
+        var src = await DbSnapshot.CaptureAsync(o.SourceConfig());
         var tgt = await DbSnapshot.CaptureAsync(o.Config(o.TargetDb));
         var diffs = DbSnapshot.Compare(src, tgt);
 

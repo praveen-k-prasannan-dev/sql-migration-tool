@@ -57,6 +57,63 @@ public class InstallService
         return notes;
     }
 
+    /// <summary>True when the target database holds no user objects, types or schemas yet.</summary>
+    public async Task<bool> IsTargetEmptyAsync()
+    {
+        const string sql = @"
+            SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.objects WHERE is_ms_shipped = 0)
+                          OR EXISTS (SELECT 1 FROM sys.types   WHERE is_user_defined = 1)
+                          OR EXISTS (SELECT 1 FROM sys.schemas WHERE schema_id BETWEEN 5 AND 16383)
+                        THEN 0 ELSE 1 END";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        return (int)(await cmd.ExecuteScalarAsync())! == 1;
+    }
+
+    /// <summary>
+    /// Changes the (empty) target database's collation, so columns without an explicit
+    /// collation get the source's. Needs brief exclusive access to the database.
+    /// </summary>
+    public async Task<string> ChangeCollationAsync(string collation)
+    {
+        if (!await IsTargetEmptyAsync())
+            return "Collation not changed: the target database is not empty.";
+
+        var master = new ConnectionConfig
+        {
+            Server = _cfg.Server, Port = _cfg.Port, WindowsAuth = _cfg.WindowsAuth,
+            Username = _cfg.Username, Password = _cfg.Password, Database = "master"
+        };
+        // The name comes from the backup's manifest: accept only a collation the server knows.
+        await using (var check = await SqlConnectionService.OpenAsync(master))
+        await using (var cmd0  = new SqlCommand("SELECT COUNT(*) FROM sys.fn_helpcollations() WHERE name = @c", check))
+        {
+            cmd0.Parameters.AddWithValue("@c", collation);
+            if ((int)(await cmd0.ExecuteScalarAsync())! == 0)
+                return $"Collation not changed: {collation} is not supported by this server.";
+        }
+
+        var db  = SqlNames.Quote(_cfg.Database);
+        var sql = $@"
+            ALTER DATABASE {db} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+            BEGIN TRY
+                ALTER DATABASE {db} COLLATE {collation};
+            END TRY
+            BEGIN CATCH
+                ALTER DATABASE {db} SET MULTI_USER;
+                THROW;
+            END CATCH;
+            ALTER DATABASE {db} SET MULTI_USER;";
+
+        // Pooled connections to the target would block SINGLE_USER.
+        SqlConnection.ClearAllPools();
+        await using var conn = await SqlConnectionService.OpenAsync(master);
+        await using var cmd  = new SqlCommand(sql, conn) { CommandTimeout = 300 };
+        await cmd.ExecuteNonQueryAsync();
+        return $"Target database collation changed to {collation}.";
+    }
+
     /// <summary>
     /// Sets the target database to the source's compatibility level, capped at the
     /// highest level the target server supports. Returns what was done.

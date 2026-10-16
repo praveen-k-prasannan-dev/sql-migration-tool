@@ -27,6 +27,7 @@ public class frmInstall : Form
     private string                    _folder = "";
     private CancellationTokenSource?  _cts;
     private bool                      _applyCompatibilityLevel;
+    private bool                      _matchCollation;
 
     private readonly Dictionary<ManifestEntry, ListViewItem> _itemMap      = new();
     private readonly Dictionary<string, int[]>               _summaryData  = new(); // [total, success, failed]
@@ -320,24 +321,39 @@ public class frmInstall : Form
     private async Task CheckTargetAsync()
     {
         _applyCompatibilityLevel = false;
+        _matchCollation          = false;
         try
         {
-            var target = await new InstallService(_cfg).GetTargetInfoAsync();
+            var svc    = new InstallService(_cfg);
+            var target = await svc.GetTargetInfoAsync();
             var notes  = InstallService.DescribeDifferences(_manifest!, target);
             if (notes.Count == 0) return;
 
-            var levelsDiffer = _manifest!.SqlCompatibilityLevel != target.CompatibilityLevel;
-            var text = string.Join("\n\n", notes) +
-                       (levelsDiffer
-                           ? $"\n\nSet the target to compatibility level {Math.Min(_manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel)} when installing?"
-                           : "");
+            const string title = "Target database differs from the source";
+            var collationDiffers = _manifest!.DatabaseCollation is { } source && target.Collation is { } tc &&
+                                   !string.Equals(source, tc, StringComparison.OrdinalIgnoreCase);
+            var levelsDiffer     = _manifest.SqlCompatibilityLevel != target.CompatibilityLevel;
 
-            _applyCompatibilityLevel = levelsDiffer &&
-                MessageBox.Show(text, "Target database differs from the source",
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
-            if (!levelsDiffer)
-                MessageBox.Show(text, "Target database differs from the source",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            // An empty target can take the source's collation, so every column matches.
+            if (collationDiffers && await svc.IsTargetEmptyAsync())
+            {
+                _matchCollation = MessageBox.Show(
+                    $"The target database collation is {target.Collation}, the source's was {_manifest.DatabaseCollation}.\n\n" +
+                    "The target is empty, so its collation can be changed to match the source. Otherwise columns " +
+                    "without an explicit collation will use the target's, which can change sorting, comparisons " +
+                    $"and case sensitivity.\n\nChange the target database collation to {_manifest.DatabaseCollation} when installing?",
+                    title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
+                notes.RemoveAt(0);   // the collation note, answered above
+            }
+
+            if (notes.Count == 0) return;
+            var text = string.Join("\n\n", notes);
+            if (levelsDiffer)
+                _applyCompatibilityLevel = MessageBox.Show(
+                    text + $"\n\nSet the target to compatibility level {Math.Min(_manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel)} when installing?",
+                    title, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+            else
+                MessageBox.Show(text, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         catch (Exception ex)
         {
@@ -603,6 +619,8 @@ public class frmInstall : Form
                 return;
             }
 
+            if (_matchCollation && _manifest.DatabaseCollation is { } sourceCollation)
+                lblStatus.Text = await svc.ChangeCollationAsync(sourceCollation);
             if (_applyCompatibilityLevel)
                 lblStatus.Text = await svc.ApplyCompatibilityLevelAsync(_manifest);
 

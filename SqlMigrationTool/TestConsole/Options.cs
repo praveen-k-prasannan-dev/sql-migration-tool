@@ -19,11 +19,22 @@ public sealed class Options
     public bool    Cleanup    { get; private set; }
     public bool    Preview    { get; private set; }
     public bool    ApplyCompat { get; private set; }
+    public bool    MatchCollation { get; private set; }
     public bool    Security   { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
     public string? Folder     { get; private set; }
+
+    public string? SourceServer { get; private set; }
+
+    /// <summary>The source database; on --source-server when given, else on --server.</summary>
+    public ConnectionConfig SourceConfig()
+    {
+        var cfg = Config(SourceDb);
+        if (SourceServer != null) cfg.Server = SourceServer;
+        return cfg;
+    }
 
     public ConnectionConfig Config(string database) => new()
     {
@@ -49,6 +60,7 @@ public sealed class Options
             switch (args[i])
             {
                 case "--server":     o.Server     = Next(); break;
+                case "--source-server": o.SourceServer = Next(); break;
                 case "--user":       o.User       = Next(); break;
                 case "--password":   o.Password   = Next(); break;
                 case "--source":     o.SourceDb   = Next(); break;
@@ -62,6 +74,7 @@ public sealed class Options
                 case "--cleanup":    o.Cleanup    = true; break;
                 case "--preview":    o.Preview    = true; break;
                 case "--apply-compat": o.ApplyCompat = true; break;
+                case "--match-collation": o.MatchCollation = true; break;
                 case "--security":   o.Security   = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
@@ -90,6 +103,7 @@ public sealed class Options
 
             Options:
               --server <name>      SQL Server instance (default: .)
+              --source-server <n>  instance of the source database, when it differs from --server
               --user <login>       SQL authentication login (default: Windows authentication)
               --password <pwd>     SQL authentication password
               --source <db>        Source database (default: SqlMigTest_Source)
@@ -108,6 +122,7 @@ public sealed class Options
               --keep-target        install: install over the existing target instead of recreating it
               --preview            install: write preview_install.sql only; execute nothing
               --apply-compat       set the target to the source's compatibility level (capped by the server)
+              --match-collation    give an empty target the source's database collation
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

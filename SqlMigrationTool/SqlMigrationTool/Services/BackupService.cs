@@ -94,12 +94,19 @@ public class BackupService
         var procs    = selectedObjects.Where(o => o.Type == ObjectTypes.Proc).ToList();
         var triggers = selectedObjects.Where(o => o.Type == ObjectTypes.Trigger).ToList();
 
+        // Views, functions and procedures share one folder, written in dependency
+        // order so each object is created after the objects it references.
+        var programmable = selectedObjects
+            .Where(o => o.Type is ObjectTypes.View or ObjectTypes.Func or ObjectTypes.Proc)
+            .ToList();
+        var (orderedProgrammable, cyclic) = await DependencyResolver.OrderAsync(_cfg, programmable);
+        foreach (var obj in cyclic)
+            progress.Report(new BackupProgress($"  ! {obj.Type} {obj.FullName} is part of a dependency cycle; it may need a second install run"));
+
         var schemaSteps = new SchemaStep[]
         {
-            new(ObjectTypes.Table, "tables",            _schema.ScriptTableAsync),
-            new(ObjectTypes.View,  "views",             _schema.ScriptViewAsync),
-            new(ObjectTypes.Func,  "functions",         _schema.ScriptFuncAsync),
-            new(ObjectTypes.Proc,  "stored_procedures", _schema.ScriptProcAsync),
+            new("tables",          tables),
+            new("programmability", orderedProgrammable),
         };
 
         foreach (var step in schemaSteps)
@@ -107,27 +114,27 @@ public class BackupService
             var stepDir = Path.Combine(outputFolder, "01_schema", step.Folder);
             Directory.CreateDirectory(stepDir);
 
-            foreach (var obj in selectedObjects.Where(o => o.Type == step.Type))
+            foreach (var obj in step.Objects)
             {
                 ct.ThrowIfCancellationRequested();
-                progress.Report(new BackupProgress($"> Scripting {step.Type} {obj.FullName}"));
+                progress.Report(new BackupProgress($"> Scripting {obj.Type} {obj.FullName}"));
                 try
                 {
-                    var script   = await step.Script(obj);
+                    var script   = await ScriptObjectAsync(obj);
                     var fileName = $"{orderCounter:D3}_{SanitiseName(obj.FullName)}.sql";
                     await File.WriteAllTextAsync(Path.Combine(stepDir, fileName), script, ct);
                     phase1.Files.Add(new ManifestEntry
                     {
                         Order  = orderCounter++,
-                        Type   = step.Type,
+                        Type   = obj.Type,
                         Object = obj.FullName,
                         File   = $"01_schema/{step.Folder}/{fileName}"
                     });
-                    progress.Report(new BackupProgress($"✔ {step.Type} {obj.FullName}", step.Type, true));
+                    progress.Report(new BackupProgress($"✔ {obj.Type} {obj.FullName}", obj.Type, true));
                 }
                 catch (Exception ex)
                 {
-                    progress.Report(new BackupProgress($"✘ {step.Type} {obj.FullName}: {ex.Message}", step.Type, false));
+                    progress.Report(new BackupProgress($"✘ {obj.Type} {obj.FullName}: {ex.Message}", obj.Type, false));
                 }
             }
         }
@@ -278,7 +285,16 @@ public class BackupService
 
     private sealed record PrereqStep(string Type, string FileBase, string Label, Func<Task<string?>> Script);
 
-    private sealed record SchemaStep(string Type, string Folder, Func<DatabaseObject, Task<string>> Script);
+    private sealed record SchemaStep(string Folder, List<DatabaseObject> Objects);
+
+    private Task<string> ScriptObjectAsync(DatabaseObject obj) => obj.Type switch
+    {
+        ObjectTypes.Table => _schema.ScriptTableAsync(obj),
+        ObjectTypes.View  => _schema.ScriptViewAsync(obj),
+        ObjectTypes.Func  => _schema.ScriptFuncAsync(obj),
+        ObjectTypes.Proc  => _schema.ScriptProcAsync(obj),
+        _ => throw new NotSupportedException($"No scripter for object type {obj.Type}")
+    };
 
     private static string SanitiseName(string name)
         => name.Replace('.', '_').Replace('[', '_').Replace(']', '_')

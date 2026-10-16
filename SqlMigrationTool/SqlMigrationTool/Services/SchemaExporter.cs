@@ -110,7 +110,8 @@ public class SchemaExporter
     {
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
-        var columns = await GetColumnDefsAsync(conn, tbl.Schema, tbl.Name);
+        var objectId = await GetObjectIdAsync(conn, tbl.Schema, tbl.Name);
+        var columns  = await GetColumnDefsAsync(conn, objectId, forTableType: false);
         var pkCols  = await GetPrimaryKeyColsAsync(conn, tbl.Schema, tbl.Name);
         var pkName  = await GetPrimaryKeyNameAsync(conn, tbl.Schema, tbl.Name);
 
@@ -347,88 +348,144 @@ public class SchemaExporter
 
     // ── Column helpers ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Column definitions for a table or table type, read from sys.columns so that
+    /// alias types, collations, precision and column options survive the round trip.
+    /// Named defaults keep their names except inside table types, where constraint
+    /// names are not allowed.
+    /// </summary>
     private static async Task<List<string>> GetColumnDefsAsync(
-        SqlConnection conn, string schema, string table)
+        SqlConnection conn, int objectId, bool forTableType)
     {
         const string sql = @"
-            SELECT c.COLUMN_NAME, c.DATA_TYPE,
-                   c.CHARACTER_MAXIMUM_LENGTH,
-                   c.NUMERIC_PRECISION, c.NUMERIC_SCALE,
-                   c.IS_NULLABLE, c.COLUMN_DEFAULT,
-                   COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME),c.COLUMN_NAME,'IsIdentity') AS IsIdentity,
-                   IDENT_SEED(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)  AS IdentSeed,
-                   IDENT_INCR(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)  AS IdentIncr,
-                   COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME),c.COLUMN_NAME,'IsComputed') AS IsComputed,
-                   cc.definition  AS ComputedDef,
-                   cc.is_persisted AS IsPersisted
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            LEFT JOIN sys.computed_columns cc
-                ON cc.object_id = OBJECT_ID(c.TABLE_SCHEMA+'.'+c.TABLE_NAME)
-               AND cc.name = c.COLUMN_NAME
-            WHERE c.TABLE_SCHEMA = @schema AND c.TABLE_NAME = @table
-            ORDER BY c.ORDINAL_POSITION";
+            SELECT c.name,
+                   ty.name                          AS TypeName,
+                   ty.is_user_defined               AS IsAliasType,
+                   SCHEMA_NAME(ty.schema_id)        AS TypeSchema,
+                   c.max_length, c.precision, c.scale,
+                   c.is_nullable,
+                   c.collation_name,
+                   CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname) AS DbCollation,
+                   c.is_identity,
+                   CAST(ic.seed_value      AS varchar(40)) AS IdentSeed,
+                   CAST(ic.increment_value AS varchar(40)) AS IdentIncr,
+                   ic.is_not_for_replication        AS IdentNotForRepl,
+                   cc.definition                    AS ComputedDef,
+                   cc.is_persisted,
+                   c.is_sparse, c.is_rowguidcol, c.is_filestream,
+                   dc.name                          AS DefaultName,
+                   dc.definition                    AS DefaultDef,
+                   dc.is_system_named               AS DefaultAutoNamed,
+                   SCHEMA_NAME(x.schema_id)         AS XmlSchema,
+                   x.name                           AS XmlCollection,
+                   c.is_xml_document
+            FROM sys.columns c
+            JOIN sys.types ty                      ON ty.user_type_id = c.user_type_id
+            LEFT JOIN sys.identity_columns ic      ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            LEFT JOIN sys.computed_columns cc      ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+            LEFT JOIN sys.default_constraints dc   ON dc.object_id = c.default_object_id
+            LEFT JOIN sys.xml_schema_collections x ON x.xml_collection_id = c.xml_collection_id
+                                                  AND c.xml_collection_id > 1
+            WHERE c.object_id = @id
+            ORDER BY c.column_id";
 
         await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@schema", schema);
-        cmd.Parameters.AddWithValue("@table",  table);
+        cmd.Parameters.AddWithValue("@id", objectId);
 
         var defs = new List<string>();
         await using var rdr = await cmd.ExecuteReaderAsync();
         while (await rdr.ReadAsync())
         {
-            var colName    = rdr.GetString(0);
-            var dataType   = rdr.GetString(1).ToUpper();
-            var charMax    = rdr.IsDBNull(2) ? (int?)null : rdr.GetInt32(2);
-            var numPrec    = rdr.IsDBNull(3) ? (int?)null : rdr.GetByte(3);
-            var numScale   = rdr.IsDBNull(4) ? (int?)null : rdr.GetInt32(4);
-            var isNullable = rdr.GetString(5) == "YES";
-            var defVal     = rdr.IsDBNull(6)  ? null : rdr.GetString(6);
-            var isIdent    = !rdr.IsDBNull(7) && rdr.GetInt32(7) == 1;
-            var identSeed  = rdr.IsDBNull(8)  ? 1    : Convert.ToInt32(rdr.GetValue(8));
-            var identIncr  = rdr.IsDBNull(9)  ? 1    : Convert.ToInt32(rdr.GetValue(9));
-            var isComputed  = !rdr.IsDBNull(10) && rdr.GetInt32(10) == 1;
-            var computedDef = rdr.IsDBNull(11)  ? null : rdr.GetString(11);
-            var isPersisted = !rdr.IsDBNull(12) && rdr.GetBoolean(12);
+            string? Str(string col)  => rdr[col] is DBNull ? null : (string)rdr[col];
+            bool    Bool(string col) => rdr[col] is bool b && b;
 
-            if (isComputed)
+            var colName = SqlNames.Quote(rdr.GetString(0));
+
+            var computedDef = Str("ComputedDef");
+            if (computedDef != null)
             {
-                if (computedDef != null)
-                {
-                    var persistedKw = isPersisted ? " PERSISTED" : "";
-                    defs.Add($"[{colName}] AS {computedDef}{persistedKw}");
-                }
+                var persisted = Bool("is_persisted")
+                    ? " PERSISTED" + (Bool("is_nullable") ? "" : " NOT NULL")
+                    : "";
+                defs.Add($"{colName} AS {computedDef}{persisted}");
                 continue;
             }
 
-            var typeDef = BuildTypeDef(dataType, charMax, numPrec, numScale);
-            var identDef = isIdent ? $" IDENTITY({identSeed},{identIncr})" : "";
-            var nullDef  = isNullable ? " NULL" : " NOT NULL";
-            var defDef   = defVal != null ? $" DEFAULT {defVal}" : "";
+            var sb = new StringBuilder(colName).Append(' ');
 
-            defs.Add($"[{colName}] {typeDef}{identDef}{defDef}{nullDef}");
+            sb.Append(Bool("IsAliasType")
+                ? SqlNames.Quote(rdr.GetString(3), rdr.GetString(1))
+                : BuildTypeDef(rdr.GetString(1),
+                               Convert.ToInt32(rdr["max_length"]),
+                               Convert.ToInt32(rdr["precision"]),
+                               Convert.ToInt32(rdr["scale"]),
+                               Str("XmlSchema"), Str("XmlCollection"), Bool("is_xml_document")));
+
+            var collation = Str("collation_name");
+            if (collation != null && collation != Str("DbCollation"))
+                sb.Append($" COLLATE {collation}");
+
+            if (Bool("is_filestream")) sb.Append(" FILESTREAM");
+            if (Bool("is_sparse"))     sb.Append(" SPARSE");
+
+            if (Bool("is_identity"))
+            {
+                sb.Append($" IDENTITY({Str("IdentSeed")},{Str("IdentIncr")})");
+                if (Bool("IdentNotForRepl")) sb.Append(" NOT FOR REPLICATION");
+            }
+
+            if (Bool("is_rowguidcol")) sb.Append(" ROWGUIDCOL");
+
+            sb.Append(Bool("is_nullable") ? " NULL" : " NOT NULL");
+
+            var defaultDef = Str("DefaultDef");
+            if (defaultDef != null)
+            {
+                if (!forTableType && !Bool("DefaultAutoNamed"))
+                    sb.Append($" CONSTRAINT {SqlNames.Quote(Str("DefaultName")!)}");
+                sb.Append($" DEFAULT {defaultDef}");
+            }
+
+            defs.Add(sb.ToString());
         }
         return defs;
     }
 
-    private static string BuildTypeDef(string dt, int? charMax, int? numPrec, int? numScale)
+    /// <summary>T-SQL type declaration for a built-in type, from sys.columns metadata.</summary>
+    private static string BuildTypeDef(string typeName, int maxLength, int precision, int scale,
+                                       string? xmlSchema, string? xmlCollection, bool xmlDocument)
     {
+        var dt = typeName.ToUpperInvariant();
         return dt switch
         {
-            "VARCHAR"   or "NVARCHAR"   or "CHAR" or "NCHAR" or "BINARY" or "VARBINARY"
-                => (charMax == null || charMax == -1)
-                    ? $"{dt}(MAX)"
-                    : $"{dt}({charMax})",
+            "VARCHAR" or "CHAR" or "VARBINARY" or "BINARY"
+                => maxLength == -1 ? $"{dt}(MAX)" : $"{dt}({maxLength})",
 
-            "DECIMAL"   or "NUMERIC"
-                => $"{dt}({numPrec ?? 18},{numScale ?? 2})",
+            // n-types store max_length in bytes: two per character
+            "NVARCHAR" or "NCHAR"
+                => maxLength == -1 ? $"{dt}(MAX)" : $"{dt}({maxLength / 2})",
 
-            "FLOAT"     => $"FLOAT({numPrec ?? 53})",
+            "DECIMAL" or "NUMERIC"
+                => $"{dt}({precision},{scale})",
 
+            // fractional-seconds precision is held in scale
             "DATETIME2" or "TIME" or "DATETIMEOFFSET"
-                => numScale.HasValue ? $"{dt}({numScale})" : dt,
+                => $"{dt}({scale})",
+
+            "XML" when xmlCollection != null
+                => $"XML({(xmlDocument ? "DOCUMENT" : "CONTENT")} {SqlNames.Quote(xmlSchema!, xmlCollection)})",
 
             _ => dt
         };
+    }
+
+    private static async Task<int> GetObjectIdAsync(SqlConnection conn, string schema, string name)
+    {
+        await using var cmd = new SqlCommand("SELECT OBJECT_ID(@n)", conn);
+        cmd.Parameters.AddWithValue("@n", SqlNames.Quote(schema, name));
+        return await cmd.ExecuteScalarAsync() is int id
+            ? id
+            : throw new InvalidOperationException($"Object {schema}.{name} not found.");
     }
 
     private static async Task<List<string>> GetPrimaryKeyColsAsync(

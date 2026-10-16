@@ -136,7 +136,23 @@ public class SchemaExporter
     public async Task<string> ScriptViewAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "V");
     public async Task<string> ScriptProcAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "P");
     public async Task<string> ScriptFuncAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "FN,IF,TF");
-    public async Task<string> ScriptTriggerAsync(DatabaseObject obj) => await ScriptDefinitionObject(obj, "TR");
+    /// <summary>Table/view trigger; re-disabled after creation when disabled in the source.</summary>
+    public async Task<string> ScriptTriggerAsync(DatabaseObject obj)
+    {
+        var script = await ScriptDefinitionObject(obj, "TR");
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(@"
+            SELECT OBJECT_SCHEMA_NAME(t.parent_id), OBJECT_NAME(t.parent_id)
+            FROM sys.triggers t
+            WHERE t.object_id = OBJECT_ID(@n) AND t.is_disabled = 1", conn);
+        cmd.Parameters.AddWithValue("@n", SqlNames.Quote(obj.Schema, obj.Name));
+        await using var rdr = await cmd.ExecuteReaderAsync();
+        if (!await rdr.ReadAsync()) return script;
+
+        var parent = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+        return script + $"DISABLE TRIGGER {SqlNames.Quote(obj.Schema, obj.Name)} ON {parent};\r\nGO\r\n";
+    }
 
     private async Task<string> ScriptDefinitionObject(DatabaseObject obj, string typeCode)
     {
@@ -535,23 +551,35 @@ public class SchemaExporter
         return cols.ToDictionary(kv => kv.Key, kv => string.Join(", ", kv.Value));
     }
 
+    /// <summary>
+    /// Foreign keys, added after the data load. Keeps referential actions,
+    /// NOT FOR REPLICATION, and the trust/enabled state: an untrusted key is added
+    /// WITH NOCHECK (existing rows may violate it) and a disabled one is
+    /// disabled again. Also re-enables CHECK constraints that are enabled but
+    /// untrusted in the source; CREATE TABLE leaves those unchecked for the load.
+    /// </summary>
     public async Task<string> ScriptForeignKeysAsync()
     {
         const string sql = @"
-            SELECT fk.name,
-                   OBJECT_SCHEMA_NAME(fk.parent_object_id)      AS ParentSchema,
-                   OBJECT_NAME(fk.parent_object_id)             AS ParentTable,
-                   pc.name                                       AS ParentColumn,
-                   OBJECT_SCHEMA_NAME(fk.referenced_object_id)  AS RefSchema,
-                   OBJECT_NAME(fk.referenced_object_id)         AS RefTable,
-                   rc.name                                       AS RefColumn,
-                   fk.delete_referential_action_desc,
-                   fk.update_referential_action_desc
+            SELECT fk.object_id, fk.name,
+                   OBJECT_SCHEMA_NAME(fk.parent_object_id), OBJECT_NAME(fk.parent_object_id),
+                   OBJECT_SCHEMA_NAME(fk.referenced_object_id), OBJECT_NAME(fk.referenced_object_id),
+                   pc.name, rc.name,
+                   fk.delete_referential_action_desc, fk.update_referential_action_desc,
+                   fk.is_not_for_replication, fk.is_not_trusted, fk.is_disabled
             FROM sys.foreign_keys fk
-            JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-            JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+            JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+            JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id     AND pc.column_id = fkc.parent_column_id
             JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
-            ORDER BY ParentSchema, ParentTable, fk.name";
+            WHERE fk.is_ms_shipped = 0
+            ORDER BY 3, 4, fk.name, fkc.constraint_column_id;
+
+            SELECT OBJECT_SCHEMA_NAME(cc.parent_object_id), OBJECT_NAME(cc.parent_object_id), cc.name
+            FROM sys.check_constraints cc
+            JOIN sys.objects o ON o.object_id = cc.parent_object_id
+            WHERE o.type = 'U' AND o.is_ms_shipped = 0
+              AND cc.is_disabled = 0 AND cc.is_not_trusted = 1 AND cc.is_system_named = 0
+            ORDER BY 1, 2, 3;";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
         await using var cmd  = new SqlCommand(sql, conn);
@@ -561,45 +589,58 @@ public class SchemaExporter
         sb.AppendLine("-- Foreign Key Constraints");
         sb.AppendLine();
 
-        var fkLines = new Dictionary<string, List<(string parent, string pCol, string refSchema, string refTable, string rCol, string del, string upd)>>();
-
+        // Rows arrive one per column, grouped by key.
+        var keys = new List<(string name, string table, string refTable, List<string> cols, List<string> refCols,
+                             string del, string upd, bool notForRepl, bool notTrusted, bool disabled)>();
+        int lastId = 0;
         while (await rdr.ReadAsync())
         {
-            var fkName    = rdr.GetString(0);
-            var pSchema   = rdr.GetString(1);
-            var pTable    = rdr.GetString(2);
-            var pCol      = rdr.GetString(3);
-            var rSchema   = rdr.GetString(4);
-            var rTable    = rdr.GetString(5);
-            var rCol      = rdr.GetString(6);
-            var delAction = rdr.GetString(7);
-            var updAction = rdr.GetString(8);
-
-            var key = $"{pSchema}.{pTable}|{fkName}";
-            if (!fkLines.ContainsKey(key))
-                fkLines[key] = new();
-            fkLines[key].Add((pSchema + "." + pTable, pCol, rSchema, rTable, rCol, delAction, updAction));
+            if (rdr.GetInt32(0) != lastId)
+            {
+                lastId = rdr.GetInt32(0);
+                keys.Add((rdr.GetString(1),
+                          SqlNames.Quote(rdr.GetString(2), rdr.GetString(3)),
+                          SqlNames.Quote(rdr.GetString(4), rdr.GetString(5)),
+                          new(), new(),
+                          rdr.GetString(8).Replace('_', ' '), rdr.GetString(9).Replace('_', ' '),
+                          rdr.GetBoolean(10), rdr.GetBoolean(11), rdr.GetBoolean(12)));
+            }
+            keys[^1].cols.Add(SqlNames.Quote(rdr.GetString(6)));
+            keys[^1].refCols.Add(SqlNames.Quote(rdr.GetString(7)));
         }
 
-        foreach (var (key, cols) in fkLines)
+        foreach (var k in keys)
         {
-            var parts   = key.Split('|');
-            var fkName  = parts[1];
-            var (pFull, pCol, rSchema, rTable, rCol, del, upd) = cols[0];
-            var pParts  = pFull.Split('.');
-
-            var pColList = string.Join(", ", cols.Select(c => $"[{c.pCol}]"));
-            var rColList = string.Join(", ", cols.Select(c => $"[{c.rCol}]"));
-
-            sb.AppendLine($"IF OBJECT_ID(N'{fkName}','F') IS NULL");
-            sb.AppendLine($"ALTER TABLE [{pParts[0]}].[{pParts[1]}]");
-            sb.AppendLine($"    ADD CONSTRAINT [{fkName}]");
-            sb.AppendLine($"    FOREIGN KEY ({pColList})");
-            sb.AppendLine($"    REFERENCES [{rSchema}].[{rTable}] ({rColList})");
-            sb.AppendLine($"    ON DELETE {del.Replace("_", " ")}");
-            sb.AppendLine($"    ON UPDATE {upd.Replace("_", " ")};");
+            var name   = SqlNames.Quote(k.name);
+            var schema = k.table[..k.table.IndexOf("].[", StringComparison.Ordinal)] + "]";
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal($"{schema}.{name}")}, 'F') IS NULL");
+            sb.AppendLine($"ALTER TABLE {k.table} WITH {(k.notTrusted ? "NOCHECK" : "CHECK")}");
+            sb.AppendLine($"    ADD CONSTRAINT {name}");
+            sb.AppendLine($"    FOREIGN KEY ({string.Join(", ", k.cols)})");
+            sb.AppendLine($"    REFERENCES {k.refTable} ({string.Join(", ", k.refCols)})");
+            sb.AppendLine($"    ON DELETE {k.del}");
+            sb.AppendLine($"    ON UPDATE {k.upd}{(k.notForRepl ? "\r\n    NOT FOR REPLICATION" : "")};");
             sb.AppendLine("GO");
+            if (k.disabled)
+            {
+                sb.AppendLine($"ALTER TABLE {k.table} NOCHECK CONSTRAINT {name};");
+                sb.AppendLine("GO");
+            }
             sb.AppendLine();
+        }
+
+        await rdr.NextResultAsync();
+        var untrusted = new StringBuilder();
+        while (await rdr.ReadAsync())
+        {
+            // Without WITH CHECK the constraint is enabled for new rows but stays untrusted.
+            untrusted.AppendLine($"ALTER TABLE {SqlNames.Quote(rdr.GetString(0), rdr.GetString(1))} CHECK CONSTRAINT {SqlNames.Quote(rdr.GetString(2))};");
+            untrusted.AppendLine("GO");
+        }
+        if (untrusted.Length > 0)
+        {
+            sb.AppendLine("-- CHECK constraints enabled but not trusted in the source");
+            sb.Append(untrusted);
         }
 
         return sb.ToString();
@@ -885,7 +926,9 @@ public class SchemaExporter
 
     /// <summary>
     /// PRIMARY KEY, UNIQUE and CHECK constraint lines for CREATE TABLE, plus the
-    /// names of CHECK constraints that are disabled in the source.
+    /// names of CHECK constraints that are disabled or untrusted in the source.
+    /// Those are switched off after CREATE TABLE so the data load cannot fail on
+    /// rows that violate them; ScriptForeignKeysAsync re-enables the untrusted ones.
     /// </summary>
     private static async Task<(List<string> lines, List<string> disabledChecks)> GetTableConstraintsAsync(
         SqlConnection conn, int objectId)
@@ -897,7 +940,8 @@ public class SchemaExporter
             JOIN sys.indexes i ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id
             WHERE k.parent_object_id = @id
             UNION ALL
-            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition, cc.is_disabled, 2
+            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition,
+                   cc.is_disabled | cc.is_not_trusted, 2
             FROM sys.check_constraints cc
             WHERE cc.parent_object_id = @id
             ORDER BY SortKey, 2";   // PK, UQ, then CHECK

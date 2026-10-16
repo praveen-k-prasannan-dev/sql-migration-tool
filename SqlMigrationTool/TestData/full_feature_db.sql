@@ -165,6 +165,11 @@ CREATE TABLE Audit.Archive
     CONSTRAINT PK_Archive PRIMARY KEY CLUSTERED (ArchiveId, [Year])
 ) ON psYear ([Year]);
 GO
+-- FK with NOT FOR REPLICATION and SET NULL / CASCADE actions.
+ALTER TABLE Audit.ChangeLog ADD CustomerId INT NULL
+    CONSTRAINT FK_ChangeLog_Customer FOREIGN KEY REFERENCES dbo.Customer (CustomerId)
+    ON DELETE SET NULL ON UPDATE NO ACTION NOT FOR REPLICATION;
+GO
 
 -- ── Synonym ──────────────────────────────────────────────────────────────────
 CREATE SYNONYM dbo.Orders FOR Sales.[Order];
@@ -326,6 +331,9 @@ INSERT dbo.HeapLog (Msg, Payload, SparseCol, Precise, Amount, Ratio) VALUES
     (N'second', NULL,         42,   NULL,                          0.0001,              1.0E-300);  -- exact duplicate (heap)
 GO
 INSERT Audit.Archive (ArchiveId, [Year], Info) VALUES (1, 2023, N'old'), (2, 2024, N'mid'), (3, 2025, N'new');
+GO
+-- Enabled but untrusted CHECK: the 2023 row above violates it.
+ALTER TABLE Audit.Archive WITH NOCHECK ADD CONSTRAINT CK_Archive_Year CHECK ([Year] >= 2024);
 GO
 -- Advance the sequence past the rows above so RESTART WITH is testable.
 SELECT NEXT VALUE FOR Sales.OrderNumberSeq;

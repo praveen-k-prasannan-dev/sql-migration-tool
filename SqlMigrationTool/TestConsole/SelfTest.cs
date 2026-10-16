@@ -39,6 +39,30 @@ public static class SelfTest
         Batches("empty batches dropped",           "GO\n\nGO\nSELECT 1\nGO\n",          "SELECT 1");
 
         Console.WriteLine();
+        Out.Step("Saved passwords (DPAPI)");
+        const string secret = "pässwörd'; DROP TABLE x;--";
+        var encoded = ProfileService.EncodePassword(secret);
+        Check("encoded form is DPAPI, not plain Base64", encoded.StartsWith("dpapi:") &&
+              !encoded.Contains(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(secret))));
+        Check("round trip",                         ProfileService.DecodePassword(encoded) == secret);
+        Check("two encodings differ (salted)",      ProfileService.EncodePassword(secret) != encoded);
+        Check("v1 Base64 still decodes",            ProfileService.DecodePassword(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(secret))) == secret);
+        Check("tampered value decodes to empty",    ProfileService.DecodePassword("dpapi:AAAA") == "");
+        Check("empty stays empty",                  ProfileService.EncodePassword("") == "" && ProfileService.DecodePassword("") == "");
+
+        var profiles = new List<SqlMigrationTool.Models.ConnectionProfile>
+        {
+            new() { Name = "v1",   Password = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("old")) },
+            new() { Name = "v2",   Password = ProfileService.EncodePassword("new") },
+            new() { Name = "none", Password = "" }
+        };
+        var changed = ProfileService.UpgradePasswords(profiles);
+        Check("v1 profiles upgraded on load", changed &&
+              profiles[0].Password.StartsWith("dpapi:") && ProfileService.DecodePassword(profiles[0].Password) == "old" &&
+              ProfileService.DecodePassword(profiles[1].Password) == "new" && profiles[2].Password == "");
+        Check("upgrade is idempotent",              !ProfileService.UpgradePasswords(profiles));
+
+        Console.WriteLine();
         Out.Step($"Self-test: {(failures == 0 ? "all passed" : $"{failures} failed")}");
         return failures == 0 ? 0 : 1;
     }

@@ -15,12 +15,14 @@ public static class ObjectTypes
     public const string Data    = "DATA";
     public const string Fk      = "FK";
     public const string Index   = "INDEX";
-    public const string Schema  = "SCHEMA";
+    public const string Schema   = "SCHEMA";
+    public const string DataType = "UDDT";
 
     /// <summary>Display order and labels for the backup/install summary grids.</summary>
     public static readonly (string Type, string Label)[] SummaryRows =
     {
-        (Schema,  "Schemas"),
+        (Schema,   "Schemas"),
+        (DataType, "Data Types"),
         (Table,   "Tables"),
         (Data,    "Data Files"),
         (View,    "Views"),

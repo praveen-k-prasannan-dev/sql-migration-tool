@@ -47,7 +47,8 @@ public class BackupService
 
         var prereqSteps = new PrereqStep[]
         {
-            new(ObjectTypes.Schema, "schemas", "Schemas", _schema.ScriptSchemasAsync),
+            new(ObjectTypes.Schema,   "schemas",                 "Schemas",                  _schema.ScriptSchemasAsync),
+            new(ObjectTypes.DataType, "user_defined_data_types", "User-Defined Data Types",  _schema.ScriptDataTypesAsync),
         };
 
         foreach (var step in prereqSteps)

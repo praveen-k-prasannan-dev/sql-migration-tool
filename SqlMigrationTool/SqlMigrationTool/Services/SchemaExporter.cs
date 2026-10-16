@@ -217,6 +217,39 @@ public class SchemaExporter
         return count == 0 ? null : sb.ToString();
     }
 
+    /// <summary>CREATE TYPE ... FROM for every alias (user-defined data) type, or null when there are none.</summary>
+    public async Task<string?> ScriptDataTypesAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(t.schema_id), t.name, TYPE_NAME(t.system_type_id),
+                   t.max_length, t.precision, t.scale, t.is_nullable
+            FROM sys.types t
+            WHERE t.is_user_defined = 1 AND t.is_table_type = 0 AND t.is_assembly_type = 0
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- User-Defined Data Types");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name     = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            var baseType = BuildTypeDef(rdr.GetString(2), rdr.GetInt16(3), rdr.GetByte(4), rdr.GetByte(5),
+                                        null, null, false);
+            var nullable = rdr.GetBoolean(6) ? "NULL" : "NOT NULL";
+
+            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(name)}) IS NULL");
+            sb.AppendLine($"    CREATE TYPE {name} FROM {baseType} {nullable};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     public async Task<string> ScriptForeignKeysAsync()
     {
         const string sql = @"

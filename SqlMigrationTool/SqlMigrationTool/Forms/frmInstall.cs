@@ -309,8 +309,9 @@ public class frmInstall : Form
         var totalFiles = _manifest.Phases.Sum(p => p.Files.Count);
         var s = _manifest.Summary;
         lblManifestInfo.Text =
-            $"✔ app_install.config.json found\r\n" +
-            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})\r\n" +
+            $"✔ app_install.config.json found  (backup format {_manifest.Version})\r\n" +
+            $"Source:  {_manifest.SourceServer} \\ {_manifest.SourceDatabase}  ({_manifest.Created[..10]})" +
+            (_manifest.DatabaseCollation is { } collation ? $"   Collation: {collation}" : "") + "\r\n" +
             $"Files:   {totalFiles} across {_manifest.Phases.Count} phases\r\n" +
             $"Tables:{s.TotalTables}  Views:{s.TotalViews}  Procs:{s.TotalProcedures}  Functions:{s.TotalFunctions}  DataFiles:{s.TotalDataFiles}";
 

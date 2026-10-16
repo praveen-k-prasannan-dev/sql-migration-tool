@@ -605,60 +605,137 @@ public class SchemaExporter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE INDEX for every index on user tables and indexed views that is not
+    /// backing a PRIMARY KEY / UNIQUE constraint: key order, INCLUDE columns,
+    /// filter, options, compression and partition scheme. Clustered indexes come
+    /// first on each object so nonclustered ones are not rebuilt. XML, spatial and
+    /// hash indexes cannot be scripted yet and are listed as comments.
+    /// </summary>
     public async Task<string> ScriptIndexesAsync()
     {
-        const string sql = @"
-            SELECT OBJECT_SCHEMA_NAME(i.object_id) AS [Schema],
-                   OBJECT_NAME(i.object_id)         AS TableName,
-                   i.name                           AS IndexName,
-                   i.type_desc,
-                   i.is_unique,
-                   c.name                           AS ColumnName,
-                   ic.key_ordinal,
-                   ic.is_descending_key
+        const string indexSql = @"
+            SELECT i.object_id, i.index_id,
+                   OBJECT_SCHEMA_NAME(i.object_id), OBJECT_NAME(i.object_id),
+                   i.name, i.type, i.type_desc, i.is_unique, i.filter_definition,
+                   i.fill_factor, i.is_padded, i.ignore_dup_key, i.allow_row_locks, i.allow_page_locks,
+                   i.is_disabled,
+                   (SELECT TOP 1 p.data_compression_desc FROM sys.partitions p
+                    WHERE p.object_id = i.object_id AND p.index_id = i.index_id
+                    ORDER BY p.partition_number) AS Compression,
+                   ds.type AS DataSpaceType, ds.name AS DataSpaceName
             FROM sys.indexes i
-            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-            WHERE i.is_primary_key = 0
-              AND i.is_unique_constraint = 0
+            JOIN sys.objects o        ON o.object_id = i.object_id
+            LEFT JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
+            WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
               AND i.type > 0
-              AND ic.is_included_column = 0
-              AND OBJECTPROPERTY(i.object_id,'IsUserTable') = 1
-            ORDER BY TableName, IndexName, ic.key_ordinal";
+              AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
+              AND i.is_hypothetical = 0
+            ORDER BY 3, 4, CASE WHEN i.type IN (1, 5) THEN 0 ELSE 1 END, i.name";
+
+        const string columnSql = @"
+            SELECT ic.object_id, ic.index_id, c.name,
+                   ic.key_ordinal, ic.is_descending_key, ic.is_included_column, ic.partition_ordinal
+            FROM sys.index_columns ic
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            JOIN sys.objects o ON o.object_id = ic.object_id
+            WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
+            ORDER BY ic.object_id, ic.index_id, ic.key_ordinal, c.name";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(sql, conn);
-        await using var rdr  = await cmd.ExecuteReaderAsync();
 
-        var indexes = new Dictionary<string, (string schema, string table, string type, bool unique, List<(string col, bool desc)> cols)>();
-        while (await rdr.ReadAsync())
+        // (object_id, index_id) -> key columns, included columns, partition column
+        var cols = new Dictionary<(int, int), (List<string> keys, List<string> includes, string? partition)>();
+        await using (var cmd = new SqlCommand(columnSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
         {
-            var schema   = rdr.GetString(0);
-            var table    = rdr.GetString(1);
-            var idxName  = rdr.GetString(2);
-            var idxType  = rdr.GetString(3);
-            var isUnique = rdr.GetBoolean(4);
-            var col      = rdr.GetString(5);
-            var desc     = rdr.GetBoolean(7);
+            while (await rdr.ReadAsync())
+            {
+                var key = (rdr.GetInt32(0), rdr.GetInt32(1));
+                if (!cols.TryGetValue(key, out var entry))
+                    cols[key] = entry = (new(), new(), null);
 
-            if (!indexes.ContainsKey(idxName))
-                indexes[idxName] = (schema, table, idxType, isUnique, new());
-            indexes[idxName].cols.Add((col, desc));
+                var name = SqlNames.Quote(rdr.GetString(2));
+                if (rdr.GetBoolean(5))
+                    entry.includes.Add(name);
+                else if (rdr.GetByte(3) > 0)
+                    entry.keys.Add(name + (rdr.GetBoolean(4) ? " DESC" : " ASC"));
+                if (rdr.GetByte(6) > 0)
+                    cols[key] = entry with { partition = name };
+            }
         }
 
         var sb = new StringBuilder();
         sb.AppendLine("-- Indexes");
         sb.AppendLine();
 
-        foreach (var (name, (schema, table, type, unique, cols)) in indexes)
+        await using (var cmd = new SqlCommand(indexSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
         {
-            var colList = string.Join(", ", cols.Select(c => $"[{c.col}]{(c.desc ? " DESC" : " ASC")}"));
-            var uniqueKw = unique ? "UNIQUE " : "";
-            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{name}' AND object_id = OBJECT_ID('[{schema}].[{table}]'))");
-            sb.AppendLine($"CREATE {uniqueKw}{type} INDEX [{name}]");
-            sb.AppendLine($"    ON [{schema}].[{table}] ({colList});");
-            sb.AppendLine("GO");
-            sb.AppendLine();
+            while (await rdr.ReadAsync())
+            {
+                var table   = SqlNames.Quote(rdr.GetString(2), rdr.GetString(3));
+                var name    = rdr.GetString(4);
+                var type    = rdr.GetByte(5);
+                var typeDsc = rdr.GetString(6);
+                cols.TryGetValue((rdr.GetInt32(0), rdr.GetInt32(1)), out var c);
+
+                if (type is 3 or 4 or 7)   // XML, SPATIAL, NONCLUSTERED HASH
+                {
+                    sb.AppendLine($"-- WARNING: {typeDsc} index {SqlNames.Quote(name)} on {table} is not supported by this tool and was not exported.");
+                    sb.AppendLine();
+                    continue;
+                }
+
+                sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID({SqlNames.Literal(table)}) AND name = {SqlNames.Literal(name)})");
+
+                var unique = rdr.GetBoolean(7) ? "UNIQUE " : "";
+                sb.Append($"CREATE {unique}{typeDsc} INDEX {SqlNames.Quote(name)} ON {table}");
+                if (type != 5)   // a clustered columnstore index has no column list
+                {
+                    // columnstore columns carry no sort order
+                    var keys = type == 6 ? c.includes.Concat(c.keys.Select(k => k[..k.LastIndexOf(' ')])) : c.keys;
+                    sb.Append($" ({string.Join(", ", keys)})");
+                }
+                sb.AppendLine();
+
+                if (type is 1 or 2 && c.includes is { Count: > 0 })
+                    sb.AppendLine($"    INCLUDE ({string.Join(", ", c.includes)})");
+                if (!rdr.IsDBNull(8))
+                    sb.AppendLine($"    WHERE {rdr.GetString(8)}");
+
+                var options = new List<string>();
+                if (type is 1 or 2)   // rowstore only: columnstore rejects these options
+                {
+                    var fill = rdr.GetByte(9);
+                    if (fill is > 0 and < 100)  options.Add($"FILLFACTOR = {fill}");
+                    if (rdr.GetBoolean(10))     options.Add("PAD_INDEX = ON");
+                    if (rdr.GetBoolean(11))     options.Add("IGNORE_DUP_KEY = ON");
+                    if (!rdr.GetBoolean(12))    options.Add("ALLOW_ROW_LOCKS = OFF");
+                    if (!rdr.GetBoolean(13))    options.Add("ALLOW_PAGE_LOCKS = OFF");
+                }
+                var compression = rdr.IsDBNull(15) ? "NONE" : rdr.GetString(15);
+                if (compression is "ROW" or "PAGE" or "COLUMNSTORE_ARCHIVE")
+                    options.Add($"DATA_COMPRESSION = {compression}");
+                if (options.Count > 0)
+                    sb.AppendLine($"    WITH ({string.Join(", ", options)})");
+
+                // Partitioned indexes keep their scheme; filegroups other than the
+                // target's default may not exist there, so they are not named.
+                if (!rdr.IsDBNull(16) && rdr.GetString(16) == "PS" && c.partition != null)
+                    sb.AppendLine($"    ON {SqlNames.Quote(rdr.GetString(17))} ({c.partition})");
+
+                sb.AppendLine("GO");
+
+                // A disabled clustered index would make the table unreadable, so only
+                // nonclustered indexes are re-disabled.
+                if (rdr.GetBoolean(14) && type != 1)
+                {
+                    sb.AppendLine($"ALTER INDEX {SqlNames.Quote(name)} ON {table} DISABLE;");
+                    sb.AppendLine("GO");
+                }
+                sb.AppendLine();
+            }
         }
 
         return sb.ToString();

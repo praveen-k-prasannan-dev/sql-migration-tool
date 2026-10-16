@@ -98,7 +98,11 @@ CREATE TABLE Sales.[Order]
 GO
 CREATE NONCLUSTERED INDEX IX_Order_Customer
     ON Sales.[Order] (CustomerId) INCLUDE (Total, OrderDate)
-    WITH (FILLFACTOR = 90);
+    WITH (FILLFACTOR = 90, DATA_COMPRESSION = PAGE);
+GO
+CREATE NONCLUSTERED INDEX IX_Customer_Phone ON dbo.Customer (Phone);
+GO
+ALTER INDEX IX_Customer_Phone ON dbo.Customer DISABLE;   -- disabled index
 GO
 
 -- Composite PK, persisted computed column, FK left disabled (NOCHECK).
@@ -135,6 +139,8 @@ CREATE TABLE dbo.HeapLog
 GO
 ALTER TABLE dbo.HeapLog NOCHECK CONSTRAINT CK_HeapLog_Sparse;   -- disabled CHECK
 GO
+CREATE UNIQUE NONCLUSTERED INDEX UX_HeapLog_RowGuid ON dbo.HeapLog (RowGuid) WITH (IGNORE_DUP_KEY = ON);
+GO
 
 -- Identity with non-default seed; index name shared with dbo.Customer.
 CREATE TABLE Audit.ChangeLog
@@ -146,6 +152,8 @@ CREATE TABLE Audit.ChangeLog
 );
 GO
 CREATE NONCLUSTERED INDEX IX_CreatedAt ON Audit.ChangeLog (CreatedAt);
+GO
+CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_ChangeLog ON Audit.ChangeLog (TableName, Action);
 GO
 
 -- Partitioned table.
@@ -199,6 +207,12 @@ SELECT b.CustomerId, b.Name, COUNT(o.OrderId) AS Orders
 FROM dbo.vZ_CustomerBase b
 LEFT JOIN Sales.[Order] o ON o.CustomerId = b.CustomerId
 GROUP BY b.CustomerId, b.Name;
+GO
+CREATE VIEW dbo.vCustomerCodes WITH SCHEMABINDING
+AS
+SELECT CustomerId, Code FROM dbo.Customer;
+GO
+CREATE UNIQUE CLUSTERED INDEX CIX_vCustomerCodes ON dbo.vCustomerCodes (CustomerId);   -- indexed view
 GO
 CREATE VIEW Sales.vOrderLineTotals
 AS

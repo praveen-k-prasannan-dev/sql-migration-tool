@@ -236,7 +236,9 @@ public sealed class DbSnapshot
                          WHERE p.object_id = i.object_id AND p.index_id = i.index_id
                          ORDER BY p.partition_number) p
             WHERE i.type > 0 AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
-              AND {IsUserParent("i.object_id")}
+              AND ({IsUserParent("i.object_id")}
+                   OR EXISTS (SELECT 1 FROM sys.objects v_ WHERE v_.object_id = i.object_id
+                                AND v_.type = 'V' AND v_.is_ms_shipped = 0))   -- indexed views
             """),
 
         ("triggers", """

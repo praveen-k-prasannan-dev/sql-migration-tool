@@ -65,18 +65,36 @@ public class InstallService
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
+        // Files such as indexes.sql hold many independent objects: a failing batch
+        // must not stop the rest. Errors are collected and reported together.
+        var errors = new List<string>();
+        int executed = 0;
         foreach (var batch in batches)
         {
             ct.ThrowIfCancellationRequested();
             var trimmed = batch.Trim();
             if (string.IsNullOrWhiteSpace(trimmed)) continue;
 
+            executed++;
             await using var cmd = new SqlCommand(trimmed, conn)
             {
                 CommandTimeout = 300
             };
-            await cmd.ExecuteNonQueryAsync(ct);
+            try
+            {
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            catch (SqlException ex)
+            {
+                errors.Add(ex.Message);
+            }
         }
+
+        if (errors.Count == 1)
+            throw new InvalidOperationException(errors[0]);
+        if (errors.Count > 1)
+            throw new InvalidOperationException(
+                $"{errors.Count} of {executed} statements failed: " + string.Join(" | ", errors));
     }
 
     private async Task InsertDataFileAsync(string filePath, CancellationToken ct)

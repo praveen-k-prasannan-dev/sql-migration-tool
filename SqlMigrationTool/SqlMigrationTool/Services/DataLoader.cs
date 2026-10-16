@@ -180,9 +180,7 @@ public sealed class DataLoader
             }
             else
             {
-                if (hasIdentity) await ExecAsync(conn, $"SET IDENTITY_INSERT {name} ON;", ct, tran);
                 await InsertRowsAsync(conn, tran, name, chunk, colTypes, ct);
-                if (hasIdentity) await ExecAsync(conn, $"SET IDENTITY_INSERT {name} OFF;", ct, tran);
             }
 
             await tran.CommitAsync(ct);
@@ -231,32 +229,47 @@ public sealed class DataLoader
         }
     }
 
+    /// <summary>
+    /// Writes the chunk's rows to <paramref name="target"/> with SqlBulkCopy.
+    /// KeepNulls keeps explicit NULLs (instead of column defaults), CheckConstraints
+    /// keeps CHECK/FOREIGN KEY constraints trusted, KeepIdentity keeps identity values.
+    /// Triggers are not fired.
+    /// </summary>
     private static async Task InsertRowsAsync(SqlConnection conn, SqlTransaction tran, string target,
         DataChunk chunk, List<string?> colTypes, CancellationToken ct)
     {
-        var colList   = string.Join(", ", chunk.Columns.Select(SqlNames.Quote));
-        var paramList = string.Join(", ", chunk.Columns.Select((_, i) => $"@p{i}"));
-
-        await using var cmd = new SqlCommand($"INSERT INTO {target} ({colList}) VALUES ({paramList})", conn, tran);
-        for (int i = 0; i < chunk.Columns.Count; i++)
-        {
-            var p = new SqlParameter($"@p{i}", DBNull.Value);
-            ConfigureParameterType(p, i < colTypes.Count ? colTypes[i] : null);
-            cmd.Parameters.Add(p);
-        }
+        var table = new System.Data.DataTable();
+        foreach (var col in chunk.Columns)
+            table.Columns.Add(col, typeof(object));
 
         foreach (var row in chunk.Rows)
         {
             ct.ThrowIfCancellationRequested();
-            for (int i = 0; i < chunk.Columns.Count; i++)
+            var values = new object[chunk.Columns.Count];
+            for (int i = 0; i < values.Length; i++)
             {
                 var raw     = i < row.Length ? row[i] : null;
                 var sqlType = i < colTypes.Count ? colTypes[i] : null;
                 var val     = raw is JsonElement je ? ConvertJsonElement(je, sqlType) : raw;
-                cmd.Parameters[$"@p{i}"].Value = val ?? (object)DBNull.Value;
+                values[i]   = val ?? DBNull.Value;
             }
-            await cmd.ExecuteNonQueryAsync(ct);
+            table.Rows.Add(values);
         }
+
+        var isTemp  = target.StartsWith('#');
+        var options = SqlBulkCopyOptions.KeepNulls |
+                      (isTemp ? SqlBulkCopyOptions.Default
+                              : SqlBulkCopyOptions.KeepIdentity | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.TableLock);
+
+        using var bulk = new SqlBulkCopy(conn, options, tran)
+        {
+            DestinationTableName = target,
+            BulkCopyTimeout      = 0
+        };
+        foreach (var col in chunk.Columns)
+            bulk.ColumnMappings.Add(col, col);
+
+        await bulk.WriteToServerAsync(table, ct);
     }
 
     /// <summary>Primary key columns, else those of the first unfiltered unique index.</summary>
@@ -316,7 +329,7 @@ public sealed class DataLoader
             WHERE object_id = OBJECT_ID(@fqn) AND is_identity = 1";
 
         await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
+        cmd.Parameters.AddWithValue("@fqn", SqlNames.Quote(schema, table));
         var result = await cmd.ExecuteScalarAsync(ct);
         return Convert.ToInt32(result) > 0;
     }
@@ -326,13 +339,16 @@ public sealed class DataLoader
         List<string> columns, CancellationToken ct)
     {
         const string sql = @"
-            SELECT c.name, t.name
+            SELECT c.name,
+                   -- alias types resolve to their base type, so conversions apply to them too
+                   CASE WHEN t.is_user_defined = 1 AND t.is_assembly_type = 0 AND t.is_table_type = 0
+                        THEN TYPE_NAME(c.system_type_id) ELSE t.name END
             FROM sys.columns c
             JOIN sys.types t ON c.user_type_id = t.user_type_id
             WHERE c.object_id = OBJECT_ID(@fqn)";
 
         await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
+        cmd.Parameters.AddWithValue("@fqn", SqlNames.Quote(schema, table));
 
         var typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         await using var rdr = await cmd.ExecuteReaderAsync(ct);
@@ -415,8 +431,13 @@ public sealed class DataLoader
                 break;
 
             case "TIME":
-                if (TimeSpan.TryParse(s, out var ts))
+                if (TimeSpan.TryParse(s, System.Globalization.CultureInfo.InvariantCulture, out var ts))
                     return ts;
+                break;
+
+            case "UNIQUEIDENTIFIER":
+                if (Guid.TryParse(s, out var g))
+                    return g;
                 break;
         }
 

@@ -186,6 +186,36 @@ public class SchemaExporter
         return sb.ToString();
     }
 
+    // ── Prerequisites ───────────────────────────────────────────────────────
+
+    /// <summary>CREATE SCHEMA for every user schema, or null when there are none besides dbo.</summary>
+    public async Task<string?> ScriptSchemasAsync()
+    {
+        // schema_id 1-4 are dbo/guest/INFORMATION_SCHEMA/sys; 16384+ are fixed-role schemas.
+        const string sql = @"
+            SELECT name FROM sys.schemas
+            WHERE schema_id BETWEEN 5 AND 16383
+            ORDER BY name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Schemas");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = rdr.GetString(0);
+            sb.AppendLine($"IF SCHEMA_ID({SqlNames.Literal(name)}) IS NULL");
+            sb.AppendLine($"    EXEC({SqlNames.Literal($"CREATE SCHEMA {SqlNames.Quote(name)}")});");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     public async Task<string> ScriptForeignKeysAsync()
     {
         const string sql = @"

@@ -36,6 +36,52 @@ public class BackupService
 
         int orderCounter = 1;
 
+        // ── Phase 0: Prerequisites ───────────────────────────────────────────
+        // Database-wide objects that schema objects depend on. Always exported
+        // in full, whatever the object selection, because they are cheap and a
+        // missing one makes every dependent CREATE fail.
+        progress.Report(new BackupProgress("=== Phase 0: Prerequisites ==="));
+        var phase0    = new ManifestPhase { Phase = 0, Name = "Prerequisites (Schemas, Types)" };
+        var prereqDir = Path.Combine(outputFolder, "00_prerequisites");
+        Directory.CreateDirectory(prereqDir);
+
+        var prereqSteps = new PrereqStep[]
+        {
+            new(ObjectTypes.Schema, "schemas", "Schemas", _schema.ScriptSchemasAsync),
+        };
+
+        foreach (var step in prereqSteps)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress.Report(new BackupProgress($"> Scripting {step.Label.ToLowerInvariant()}"));
+            try
+            {
+                var script = await step.Script();
+                if (script is null)
+                {
+                    progress.Report(new BackupProgress($"  - {step.Label}: none"));
+                    continue;
+                }
+
+                var fileName = $"{orderCounter:D3}_{step.FileBase}.sql";
+                await File.WriteAllTextAsync(Path.Combine(prereqDir, fileName), script, ct);
+                phase0.Files.Add(new ManifestEntry
+                {
+                    Order  = orderCounter++,
+                    Type   = step.Type,
+                    Object = step.Label,
+                    File   = $"00_prerequisites/{fileName}"
+                });
+                progress.Report(new BackupProgress($"✔ {step.Label} scripted", step.Type, true));
+            }
+            catch (Exception ex)
+            {
+                progress.Report(new BackupProgress($"✘ {step.Label}: {ex.Message}", step.Type, false));
+            }
+        }
+
+        manifest.Phases.Add(phase0);
+
         // ── Phase 1: Schema ──────────────────────────────────────────────────
         progress.Report(new BackupProgress("=== Phase 1: Schema ==="));
         var phase1 = new ManifestPhase { Phase = 1, Name = "Schema (Tables, Views, Functions, Stored Procedures)" };
@@ -227,6 +273,8 @@ public class BackupService
         progress.Report(new BackupProgress($"✔ Backup complete. {manifest.Summary.TotalFiles} files written."));
         progress.Report(new BackupProgress($"  Manifest: {manifestPath}"));
     }
+
+    private sealed record PrereqStep(string Type, string FileBase, string Label, Func<Task<string?>> Script);
 
     private sealed record SchemaStep(string Type, string Folder, Func<DatabaseObject, Task<string>> Script);
 

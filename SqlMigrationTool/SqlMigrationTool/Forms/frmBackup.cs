@@ -160,7 +160,7 @@ public class frmBackup : Form
             DropDownStyle = ComboBoxStyle.DropDownList
         };
         foreach (var mode in Enum.GetValues<ScriptMode>())
-            cmbScriptMode.Items.Add(new ModeItem(mode));
+            cmbScriptMode.Items.Add(new ScriptModeItem(mode));
         cmbScriptMode.SelectedIndex = 0;   // DropAndCreate: the v1 behaviour
         content.Controls.Add(cmbScriptMode);
         y += 36;
@@ -465,7 +465,7 @@ public class frmBackup : Form
         try
         {
             var svc = new BackupService(_cfg);
-            var mode = ((ModeItem)cmbScriptMode.SelectedItem!).Mode;
+            var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
             await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token, mode);
 
             MessageBox.Show(
@@ -490,10 +490,5 @@ public class frmBackup : Form
             _cts?.Dispose();
             _cts = null;
         }
-    }
-
-    private sealed record ModeItem(ScriptMode Mode)
-    {
-        public override string ToString() => ScriptModeText.Label(Mode);
     }
 }

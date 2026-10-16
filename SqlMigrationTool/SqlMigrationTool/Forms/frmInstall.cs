@@ -19,6 +19,7 @@ public class frmInstall : Form
     private Button     btnStart        = null!;
     private Button     btnAbort        = null!;
     private Button     btnBack         = null!;
+    private ComboBox   cmbScriptMode   = null!;
 
     private InstallManifest?          _manifest;
     private string                    _folder = "";
@@ -130,6 +131,20 @@ public class frmInstall : Form
         btnLoad.FlatAppearance.BorderSize = 0;
         btnLoad.Click += BtnLoad_Click;
         content.Controls.Add(btnLoad);
+
+        // Script mode: preselected from the manifest; another choice re-wraps the
+        // scripts in memory at install time (the backup files are not changed).
+        content.Controls.Add(new Label { Text = "Script mode:", Location = new Point(140, y + 6), AutoSize = true });
+        cmbScriptMode = new ComboBox
+        {
+            Location      = new Point(230, y + 3),
+            Width         = 240,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Enabled       = false
+        };
+        foreach (var mode in Enum.GetValues<ScriptMode>())
+            cmbScriptMode.Items.Add(new ScriptModeItem(mode));
+        content.Controls.Add(cmbScriptMode);
         y += 38;
 
         // Manifest info panel
@@ -289,6 +304,11 @@ public class frmInstall : Form
             PopulateProgressList();
             PopulateSummaryTable();
             ShowManifestInfo();
+
+            var backupMode = InstallService.ManifestMode(_manifest);
+            cmbScriptMode.SelectedIndex = cmbScriptMode.Items.Cast<ScriptModeItem>().ToList().FindIndex(i => i.Mode == backupMode);
+            cmbScriptMode.Enabled = true;
+
             btnStart.Enabled    = true;
             lblStatus.Text      = "Manifest loaded. Ready to install.";
             lblStatus.ForeColor = Color.DarkGreen;
@@ -452,6 +472,7 @@ public class frmInstall : Form
 
         btnStart.Enabled  = false;
         btnLoad.Enabled   = false;
+        cmbScriptMode.Enabled = false;
         btnBack.Enabled   = false;
         btnAbort.Enabled  = true;
         progressBar.Value = 0;
@@ -498,7 +519,8 @@ public class frmInstall : Form
         try
         {
             var svc = new InstallService(_cfg);
-            await svc.RunAsync(_folder, _manifest, progress, _cts.Token);
+            var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
+            await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode);
 
             if (errorCount == 0)
             {
@@ -532,6 +554,7 @@ public class frmInstall : Form
         {
             btnStart.Enabled = true;
             btnLoad.Enabled  = true;
+            cmbScriptMode.Enabled = true;
             btnBack.Enabled  = true;
             btnAbort.Enabled = false;
             _cts?.Dispose();

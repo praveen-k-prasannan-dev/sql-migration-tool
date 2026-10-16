@@ -23,3 +23,9 @@ public static class ScriptModeText
         _                        => mode.ToString()
     };
 }
+
+/// <summary>A ScriptMode as a combo-box item, shown by its label.</summary>
+public sealed record ScriptModeItem(ScriptMode Mode)
+{
+    public override string ToString() => ScriptModeText.Label(Mode);
+}

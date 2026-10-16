@@ -19,9 +19,14 @@ public class InstallService
         string                     folder,
         InstallManifest            manifest,
         IProgress<InstallProgress> progress,
-        CancellationToken          ct)
+        CancellationToken          ct,
+        ScriptMode?                mode = null)
     {
         var logger = new ErrorLogger(folder);
+
+        // A mode other than the one the backup was written with: scripts are
+        // re-wrapped in memory before running; the backup files stay as they are.
+        _rewrapTo = mode is { } m && m != ManifestMode(manifest) ? m : null;
 
         foreach (var phase in manifest.Phases)
         {
@@ -54,9 +59,17 @@ public class InstallService
         logger.WriteSummary();
     }
 
+    /// <summary>The script mode a backup was written with (DropAndCreate for v1 backups).</summary>
+    public static ScriptMode ManifestMode(InstallManifest manifest) =>
+        Enum.TryParse<ScriptMode>(manifest.ScriptMode, ignoreCase: true, out var m) ? m : ScriptMode.DropAndCreate;
+
+    private ScriptMode? _rewrapTo;
+
     private async Task ExecuteSqlFileAsync(string filePath, CancellationToken ct)
     {
         var content = await File.ReadAllTextAsync(filePath, ct);
+        if (_rewrapTo is { } mode && ScriptWrapper.IsWrapped(content))
+            content = ScriptWrapper.Rewrap(content, mode);
 
         // Split on GO batch separator (SQL Server Management Studio directive)
         var batches = content.Split(

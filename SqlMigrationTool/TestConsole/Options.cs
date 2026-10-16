@@ -16,6 +16,7 @@ public sealed class Options
     public bool    Verbose    { get; private set; }
     public bool    Reinstall  { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
+    public ScriptMode? InstallMode { get; private set; }
     public string? Folder     { get; private set; }
 
     public ConnectionConfig Config(string database) => new()
@@ -52,6 +53,7 @@ public sealed class Options
                 case "--verbose":    o.Verbose    = true; break;
                 case "--reinstall":  o.Reinstall  = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
+                case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--folder":     o.Folder     = Next(); break;
                 default: return null;
             }
@@ -84,6 +86,7 @@ public sealed class Options
               --skip-setup         roundtrip: use the existing source database as-is
               --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
               --reinstall          roundtrip: install a second time over the populated target
+              --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
               --verbose            Show every backup/install progress line
               --folder <path>      install: backup folder containing app_install.config.json
 

@@ -26,6 +26,7 @@ public class frmInstall : Form
     private InstallManifest?          _manifest;
     private string                    _folder = "";
     private CancellationTokenSource?  _cts;
+    private bool                      _applyCompatibilityLevel;
 
     private readonly Dictionary<ManifestEntry, ListViewItem> _itemMap      = new();
     private readonly Dictionary<string, int[]>               _summaryData  = new(); // [total, success, failed]
@@ -312,7 +313,39 @@ public class frmInstall : Form
             txtFolder.Text = dlg.SelectedPath;
     }
 
-    private void BtnLoad_Click(object? sender, EventArgs e)
+    /// <summary>
+    /// Compares the target with the source (collation, compatibility level) and,
+    /// when the levels differ, asks whether to apply the source's level on install.
+    /// </summary>
+    private async Task CheckTargetAsync()
+    {
+        _applyCompatibilityLevel = false;
+        try
+        {
+            var target = await new InstallService(_cfg).GetTargetInfoAsync();
+            var notes  = InstallService.DescribeDifferences(_manifest!, target);
+            if (notes.Count == 0) return;
+
+            var levelsDiffer = _manifest!.SqlCompatibilityLevel != target.CompatibilityLevel;
+            var text = string.Join("\n\n", notes) +
+                       (levelsDiffer
+                           ? $"\n\nSet the target to compatibility level {Math.Min(_manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel)} when installing?"
+                           : "");
+
+            _applyCompatibilityLevel = levelsDiffer &&
+                MessageBox.Show(text, "Target database differs from the source",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+            if (!levelsDiffer)
+                MessageBox.Show(text, "Target database differs from the source",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            lblStatus.Text = $"Manifest loaded. Could not check the target: {ex.Message}";
+        }
+    }
+
+    private async void BtnLoad_Click(object? sender, EventArgs e)
     {
         _folder = txtFolder.Text.Trim();
         if (string.IsNullOrWhiteSpace(_folder))
@@ -338,6 +371,8 @@ public class frmInstall : Form
             btnStart.Enabled    = true;
             lblStatus.Text      = "Manifest loaded. Ready to install.";
             lblStatus.ForeColor = Color.DarkGreen;
+
+            await CheckTargetAsync();
         }
         catch (Exception ex)
         {
@@ -567,6 +602,9 @@ public class frmInstall : Form
                 lblStatus.ForeColor = Color.DarkGreen;
                 return;
             }
+
+            if (_applyCompatibilityLevel)
+                lblStatus.Text = await svc.ApplyCompatibilityLevelAsync(_manifest);
 
             await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
 

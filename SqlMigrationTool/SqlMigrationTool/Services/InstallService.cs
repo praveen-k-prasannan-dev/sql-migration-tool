@@ -15,6 +15,67 @@ public class InstallService
 
     public InstallService(ConnectionConfig cfg) => _cfg = cfg;
 
+    // ── Target checks ───────────────────────────────────────────────────────
+
+    public sealed record TargetInfo(string? Collation, int CompatibilityLevel, int MaxCompatibilityLevel);
+
+    /// <summary>Collation and compatibility level of the target database and the highest level its server supports.</summary>
+    public async Task<TargetInfo> GetTargetInfoAsync()
+    {
+        const string sql = @"
+            SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS sysname),
+                   (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()),
+                   -- major version 10 (2008) -> 100 ... 16 (2022) -> 160
+                   CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) * 10";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+        await rdr.ReadAsync();
+        return new TargetInfo(rdr.IsDBNull(0) ? null : rdr.GetString(0), Convert.ToInt32(rdr.GetValue(1)), rdr.GetInt32(2));
+    }
+
+    /// <summary>Notes about the target that may change behaviour after install (collation, compatibility level).</summary>
+    public static List<string> DescribeDifferences(InstallManifest manifest, TargetInfo target)
+    {
+        var notes = new List<string>();
+        if (manifest.DatabaseCollation is { } source && target.Collation is { } tc &&
+            !string.Equals(source, tc, StringComparison.OrdinalIgnoreCase))
+        {
+            notes.Add($"The target database collation is {tc}, the source's was {source}. Columns without an " +
+                      "explicit collation will use the target's, which can change sorting, comparisons and case sensitivity.");
+        }
+        if (manifest.SqlCompatibilityLevel != target.CompatibilityLevel)
+        {
+            var level = Math.Min(manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel);
+            notes.Add($"The target database runs at compatibility level {target.CompatibilityLevel}, the source at " +
+                      $"{manifest.SqlCompatibilityLevel}." +
+                      (level != manifest.SqlCompatibilityLevel
+                          ? $" The target server supports at most {target.MaxCompatibilityLevel}."
+                          : ""));
+        }
+        return notes;
+    }
+
+    /// <summary>
+    /// Sets the target database to the source's compatibility level, capped at the
+    /// highest level the target server supports. Returns what was done.
+    /// </summary>
+    public async Task<string> ApplyCompatibilityLevelAsync(InstallManifest manifest)
+    {
+        var target = await GetTargetInfoAsync();
+        var level  = Math.Min(manifest.SqlCompatibilityLevel, target.MaxCompatibilityLevel);
+        if (level == target.CompatibilityLevel)
+            return $"Compatibility level already {level}.";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(
+            $"DECLARE @sql nvarchar(400) = N'ALTER DATABASE ' + QUOTENAME(DB_NAME()) + N' SET COMPATIBILITY_LEVEL = {level}'; EXEC (@sql);", conn);
+        await cmd.ExecuteNonQueryAsync();
+        return $"Compatibility level changed from {target.CompatibilityLevel} to {level}" +
+               (level != manifest.SqlCompatibilityLevel ? $" (source {manifest.SqlCompatibilityLevel}; highest this server supports)." : ".");
+    }
+
     /// <summary>A script as it will run: re-wrapped when a different mode was chosen.</summary>
     private async Task<string> ReadScriptAsync(string filePath, CancellationToken ct)
     {
@@ -166,10 +227,7 @@ public class InstallService
     {
         var content = await ReadScriptAsync(filePath, ct);
 
-        // Split on GO batch separator (SQL Server Management Studio directive)
-        var batches = content.Split(
-            new[] { "\nGO\n", "\nGO\r\n", "\r\nGO\r\n", "\r\nGO\n", "\nGO", "\r\nGO" },
-            StringSplitOptions.RemoveEmptyEntries);
+        var batches = BatchSplitter.Split(content);
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 

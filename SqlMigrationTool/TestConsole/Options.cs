@@ -18,6 +18,8 @@ public sealed class Options
     public bool    KeepTarget { get; private set; }
     public bool    Cleanup    { get; private set; }
     public bool    Preview    { get; private set; }
+    public bool    ApplyCompat { get; private set; }
+    public bool    Security   { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
@@ -38,7 +40,7 @@ public sealed class Options
         if (args.Length == 0) return null;
 
         var o = new Options { Command = args[0].ToLowerInvariant() };
-        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install" or "rewrapcheck")) return null;
+        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install" or "rewrapcheck" or "selftest")) return null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -59,6 +61,8 @@ public sealed class Options
                 case "--keep-target": o.KeepTarget = true; break;
                 case "--cleanup":    o.Cleanup    = true; break;
                 case "--preview":    o.Preview    = true; break;
+                case "--apply-compat": o.ApplyCompat = true; break;
+                case "--security":   o.Security   = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
@@ -82,6 +86,7 @@ public sealed class Options
               compare     Compare source and target databases only
               install     Install an existing backup (--folder) into a fresh target
               rewrapcheck Back up in every mode and check re-wrapping between modes is exact
+              selftest    Offline checks of helpers (GO splitter, ...)
 
             Options:
               --server <name>      SQL Server instance (default: .)
@@ -95,12 +100,14 @@ public sealed class Options
               --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
               --reinstall          roundtrip: install a second time over the populated target
               --cleanup            roundtrip: also write the cleanup (drop-all) script
+              --security           roundtrip: include users, roles and permissions
               --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
               --data-mode <m>      SkipIfNotEmpty (default) | TruncateAndLoad | Append | Upsert
               --verbose            Show every backup/install progress line
               --folder <path>      install: backup folder containing app_install.config.json
               --keep-target        install: install over the existing target instead of recreating it
               --preview            install: write preview_install.sql only; execute nothing
+              --apply-compat       set the target to the source's compatibility level (capped by the server)
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

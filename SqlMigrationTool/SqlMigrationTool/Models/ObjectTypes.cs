@@ -24,6 +24,7 @@ public static class ObjectTypes
     public const string ExtendedProperty = "EXTPROP";
     public const string XmlSchema = "XMLSCHEMA";
     public const string Partition = "PARTITION";
+    public const string Security  = "SECURITY";
 
     /// <summary>Display order and labels for the backup/install summary grids.</summary>
     public static readonly (string Type, string Label)[] SummaryRows =
@@ -43,6 +44,7 @@ public static class ObjectTypes
         (Trigger, "Triggers"),
         (DbTrigger, "Database Triggers"),
         (ExtendedProperty, "Extended Properties"),
+        (Security, "Users, Roles & Permissions"),
         (Fk,      "Foreign Keys"),
         (Index,   "Indexes"),
     };

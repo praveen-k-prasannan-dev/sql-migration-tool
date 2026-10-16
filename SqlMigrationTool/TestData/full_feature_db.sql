@@ -98,7 +98,11 @@ CREATE TABLE Sales.[Order]
 GO
 CREATE NONCLUSTERED INDEX IX_Order_Customer
     ON Sales.[Order] (CustomerId) INCLUDE (Total, OrderDate)
-    WITH (FILLFACTOR = 90);
+    WITH (FILLFACTOR = 90, DATA_COMPRESSION = PAGE);
+GO
+CREATE NONCLUSTERED INDEX IX_Customer_Phone ON dbo.Customer (Phone);
+GO
+ALTER INDEX IX_Customer_Phone ON dbo.Customer DISABLE;   -- disabled index
 GO
 
 -- Composite PK, persisted computed column, FK left disabled (NOCHECK).
@@ -135,6 +139,8 @@ CREATE TABLE dbo.HeapLog
 GO
 ALTER TABLE dbo.HeapLog NOCHECK CONSTRAINT CK_HeapLog_Sparse;   -- disabled CHECK
 GO
+CREATE UNIQUE NONCLUSTERED INDEX UX_HeapLog_RowGuid ON dbo.HeapLog (RowGuid) WITH (IGNORE_DUP_KEY = ON);
+GO
 
 -- Identity with non-default seed; index name shared with dbo.Customer.
 CREATE TABLE Audit.ChangeLog
@@ -147,6 +153,8 @@ CREATE TABLE Audit.ChangeLog
 GO
 CREATE NONCLUSTERED INDEX IX_CreatedAt ON Audit.ChangeLog (CreatedAt);
 GO
+CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_ChangeLog ON Audit.ChangeLog (TableName, Action);
+GO
 
 -- Partitioned table.
 CREATE TABLE Audit.Archive
@@ -157,9 +165,18 @@ CREATE TABLE Audit.Archive
     CONSTRAINT PK_Archive PRIMARY KEY CLUSTERED (ArchiveId, [Year])
 ) ON psYear ([Year]);
 GO
+-- FK with NOT FOR REPLICATION and SET NULL / CASCADE actions.
+ALTER TABLE Audit.ChangeLog ADD CustomerId INT NULL
+    CONSTRAINT FK_ChangeLog_Customer FOREIGN KEY REFERENCES dbo.Customer (CustomerId)
+    ON DELETE SET NULL ON UPDATE NO ACTION NOT FOR REPLICATION;
+GO
 
 -- ── Synonym ──────────────────────────────────────────────────────────────────
 CREATE SYNONYM dbo.Orders FOR Sales.[Order];
+GO
+-- Three-part name pointing at this same database: must be restored pointing at the target.
+DECLARE @sql NVARCHAR(400) = N'CREATE SYNONYM Audit.SelfCustomer FOR ' + QUOTENAME(DB_NAME()) + N'.dbo.Customer';
+EXEC (@sql);
 GO
 
 -- ── Functions (scalar, inline TVF, multi-statement TVF) ──────────────────────
@@ -195,6 +212,12 @@ SELECT b.CustomerId, b.Name, COUNT(o.OrderId) AS Orders
 FROM dbo.vZ_CustomerBase b
 LEFT JOIN Sales.[Order] o ON o.CustomerId = b.CustomerId
 GROUP BY b.CustomerId, b.Name;
+GO
+CREATE VIEW dbo.vCustomerCodes WITH SCHEMABINDING
+AS
+SELECT CustomerId, Code FROM dbo.Customer;
+GO
+CREATE UNIQUE CLUSTERED INDEX CIX_vCustomerCodes ON dbo.vCustomerCodes (CustomerId);   -- indexed view
 GO
 CREATE VIEW Sales.vOrderLineTotals
 AS
@@ -253,6 +276,16 @@ BEGIN
     SET NOCOUNT ON;
 END
 GO
+CREATE TRIGGER trgDdlBlockDrop ON DATABASE
+FOR DROP_TABLE
+AS
+BEGIN
+    RAISERROR ('Dropping tables is not allowed.', 16, 1);
+    ROLLBACK;
+END
+GO
+DISABLE TRIGGER trgDdlBlockDrop ON DATABASE;
+GO
 
 -- ── Extended properties ──────────────────────────────────────────────────────
 EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Customer master',
@@ -263,6 +296,21 @@ EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Display na
      @level0type = N'SCHEMA', @level0name = N'dbo',
      @level1type = N'TABLE',  @level1name = N'Customer',
      @level2type = N'COLUMN', @level2name = N'Name';
+GO
+EXEC sys.sp_addextendedproperty @name = N'Owner',     @value = N'Data team';                           -- database
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Sales objects',
+     @level0type = N'SCHEMA', @level0name = N'Sales';                                                  -- schema
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Order lines to save',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'PROCEDURE', @level1name = N'uspSaveOrderLines',
+     @level2type = N'PARAMETER', @level2name = N'@Lines';                                              -- parameter
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Codes are 3+ chars',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'Customer',
+     @level2type = N'CONSTRAINT', @level2name = N'CK_Customer_Code';                                   -- constraint
+EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'Lookup by e-mail',
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TABLE', @level1name = N'Customer',
+     @level2type = N'INDEX', @level2name = N'IX_Customer_Email';                                       -- index
+EXEC sys.sp_addextendedproperty @name = N'Version',  @value = 3,
+     @level0type = N'SCHEMA', @level0name = N'dbo', @level1type = N'TYPE', @level1name = N'OrderLineTVP'; -- type, int value
 GO
 
 -- ── Security ─────────────────────────────────────────────────────────────────
@@ -298,6 +346,9 @@ INSERT dbo.HeapLog (Msg, Payload, SparseCol, Precise, Amount, Ratio) VALUES
     (N'second', NULL,         42,   NULL,                          0.0001,              1.0E-300);  -- exact duplicate (heap)
 GO
 INSERT Audit.Archive (ArchiveId, [Year], Info) VALUES (1, 2023, N'old'), (2, 2024, N'mid'), (3, 2025, N'new');
+GO
+-- Enabled but untrusted CHECK: the 2023 row above violates it.
+ALTER TABLE Audit.Archive WITH NOCHECK ADD CONSTRAINT CK_Archive_Year CHECK ([Year] >= 2024);
 GO
 -- Advance the sequence past the rows above so RESTART WITH is testable.
 SELECT NEXT VALUE FOR Sales.OrderNumberSeq;

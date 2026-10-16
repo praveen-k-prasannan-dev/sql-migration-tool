@@ -113,6 +113,7 @@ public class SchemaExporter
         var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
         var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
         lines.AddRange(constraints);
+        var placement = await GetTablePlacementAsync(conn, objectId);
 
         var name = SqlNames.Quote(tbl.Schema, tbl.Name);
         var sb = new StringBuilder();
@@ -122,7 +123,7 @@ public class SchemaExporter
         sb.AppendLine("GO");
         sb.AppendLine($"CREATE TABLE {name} (");
         sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
-        sb.AppendLine(")");
+        sb.AppendLine(")" + placement);
         sb.AppendLine("GO");
 
         foreach (var check in disabledChecks)
@@ -136,7 +137,23 @@ public class SchemaExporter
     public async Task<string> ScriptViewAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "V");
     public async Task<string> ScriptProcAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "P");
     public async Task<string> ScriptFuncAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "FN,IF,TF");
-    public async Task<string> ScriptTriggerAsync(DatabaseObject obj) => await ScriptDefinitionObject(obj, "TR");
+    /// <summary>Table/view trigger; re-disabled after creation when disabled in the source.</summary>
+    public async Task<string> ScriptTriggerAsync(DatabaseObject obj)
+    {
+        var script = await ScriptDefinitionObject(obj, "TR");
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(@"
+            SELECT OBJECT_SCHEMA_NAME(t.parent_id), OBJECT_NAME(t.parent_id)
+            FROM sys.triggers t
+            WHERE t.object_id = OBJECT_ID(@n) AND t.is_disabled = 1", conn);
+        cmd.Parameters.AddWithValue("@n", SqlNames.Quote(obj.Schema, obj.Name));
+        await using var rdr = await cmd.ExecuteReaderAsync();
+        if (!await rdr.ReadAsync()) return script;
+
+        var parent = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+        return script + $"DISABLE TRIGGER {SqlNames.Quote(obj.Schema, obj.Name)} ON {parent};\r\nGO\r\n";
+    }
 
     private async Task<string> ScriptDefinitionObject(DatabaseObject obj, string typeCode)
     {
@@ -149,21 +166,23 @@ public class SchemaExporter
         if (string.IsNullOrWhiteSpace(def))
             return $"-- WARNING: Could not retrieve definition for {obj.FullName}\r\nGO\r\n";
 
-        // Ensure it starts with CREATE (not ALTER)
         var trimmed = def.TrimStart();
 
-        var typeLabel = obj.Type switch
+        // sys.objects type codes per object type. Functions have several: scalar,
+        // inline and multi-statement table-valued, and their CLR equivalents.
+        var typeCodes = obj.Type switch
         {
-            ObjectTypes.View    => "V",
-            ObjectTypes.Proc    => "P",
-            ObjectTypes.Func    => "FN",
-            ObjectTypes.Trigger => "TR",
-            _         => "U"
+            ObjectTypes.View    => "'V'",
+            ObjectTypes.Proc    => "'P'",
+            ObjectTypes.Func    => "'FN','IF','TF','FS','FT'",
+            ObjectTypes.Trigger => "'TR'",
+            _                   => "'U'"
         };
 
+        var name = SqlNames.Quote(obj.Schema, obj.Name);
         var sb = new StringBuilder();
         sb.AppendLine($"-- {obj.Type}: {obj.FullName}");
-        sb.AppendLine($"IF OBJECT_ID(N'[{obj.Schema}].[{obj.Name}]','{typeLabel}') IS NOT NULL");
+        sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID({SqlNames.Literal(name)}) AND type IN ({typeCodes}))");
 
         var dropType = obj.Type switch
         {
@@ -173,7 +192,7 @@ public class SchemaExporter
             ObjectTypes.Trigger => "TRIGGER",
             _         => "OBJECT"
         };
-        sb.AppendLine($"    DROP {dropType} [{obj.Schema}].[{obj.Name}]");
+        sb.AppendLine($"    DROP {dropType} {name}");
         sb.AppendLine("GO");
         sb.AppendLine(trimmed);
         sb.AppendLine("GO");
@@ -285,6 +304,441 @@ public class SchemaExporter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE SEQUENCE for every sequence with its original definition (START WITH is
+    /// the original start value), or null when there are none. The current position
+    /// is restored after the data load by <see cref="ScriptSequenceRestartsAsync"/>.
+    /// </summary>
+    public async Task<string?> ScriptSequencesAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   ty.is_user_defined, SCHEMA_NAME(ty.schema_id), ty.name, TYPE_NAME(s.system_type_id),
+                   s.precision, s.scale,
+                   CAST(s.start_value   AS varchar(40)), CAST(s.increment     AS varchar(40)),
+                   CAST(s.minimum_value AS varchar(40)), CAST(s.maximum_value AS varchar(40)),
+                   s.is_cycling, s.is_cached, s.cache_size
+            FROM sys.sequences s
+            JOIN sys.types ty ON ty.user_type_id = s.user_type_id
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Sequences");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            var type = rdr.GetBoolean(2)
+                ? SqlNames.Quote(rdr.GetString(3), rdr.GetString(4))
+                : BuildTypeDef(rdr.GetString(5), 0, rdr.GetByte(6), rdr.GetByte(7), null, null, false);
+            var cache = !rdr.GetBoolean(13) ? "NO CACHE"
+                      : rdr.IsDBNull(14)    ? "CACHE"
+                      : $"CACHE {rdr.GetInt32(14)}";
+
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)}, 'SO') IS NULL");
+            sb.AppendLine($"    CREATE SEQUENCE {name} AS {type}");
+            sb.AppendLine($"        START WITH {rdr.GetString(8)} INCREMENT BY {rdr.GetString(9)}");
+            sb.AppendLine($"        MINVALUE {rdr.GetString(10)} MAXVALUE {rdr.GetString(11)}");
+            sb.AppendLine($"        {(rdr.GetBoolean(12) ? "CYCLE" : "NO CYCLE")} {cache};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// ALTER SEQUENCE ... RESTART WITH the source's next value for every sequence
+    /// that has been used, so the target continues where the source left off;
+    /// null when no sequence needs it.
+    /// </summary>
+    public async Task<string?> ScriptSequenceRestartsAsync()
+    {
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        // last_used_value exists from SQL Server 2017; before that current_value is the best available.
+        await using var probe = new SqlCommand("SELECT COL_LENGTH('sys.sequences', 'last_used_value')", conn);
+        var lastUsed = await probe.ExecuteScalarAsync() is DBNull or null ? "s.current_value" : "s.last_used_value";
+
+        var sql = $@"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   CAST({lastUsed}       AS decimal(38,0)),
+                   CAST(s.increment     AS decimal(38,0)),
+                   CAST(s.minimum_value AS decimal(38,0)),
+                   CAST(s.maximum_value AS decimal(38,0)),
+                   s.is_cycling
+            FROM sys.sequences s
+            ORDER BY 1, 2";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Sequences: continue from the source's next value");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            if (rdr.IsDBNull(2)) continue;   // never used: START WITH is already correct
+
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            decimal last = rdr.GetDecimal(2), incr = rdr.GetDecimal(3),
+                    min  = rdr.GetDecimal(4), max  = rdr.GetDecimal(5);
+            var next = last + incr;
+
+            if (next > max || next < min)
+            {
+                if (!rdr.GetBoolean(6))
+                {
+                    sb.AppendLine($"-- {name} is exhausted in the source (no CYCLE); left at its start value.");
+                    continue;
+                }
+                next = incr > 0 ? min : max;
+            }
+
+            sb.AppendLine($"ALTER SEQUENCE {name} RESTART WITH {next};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// CREATE SYNONYM for every synonym, or null when there are none. A target named
+    /// with this database's own name ([ThisDb].[schema].[object]) is reduced to a
+    /// two-part name so the restored synonym points into the target database, not
+    /// back at the source.
+    /// </summary>
+    public async Task<string?> ScriptSynonymsAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   CASE WHEN PARSENAME(s.base_object_name, 4) IS NULL
+                         AND PARSENAME(s.base_object_name, 3) = DB_NAME()
+                        THEN QUOTENAME(PARSENAME(s.base_object_name, 2)) + '.' + QUOTENAME(PARSENAME(s.base_object_name, 1))
+                        ELSE s.base_object_name
+                   END
+            FROM sys.synonyms s
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Synonyms");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)}, 'SN') IS NULL");
+            sb.AppendLine($"    CREATE SYNONYM {name} FOR {rdr.GetString(2)};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// Database-level (DDL) triggers, dropped and recreated, and re-disabled where
+    /// disabled in the source; null when there are none. Must run after all other
+    /// DDL, since these triggers fire on (and can block) schema changes.
+    /// </summary>
+    public async Task<string?> ScriptDatabaseTriggersAsync()
+    {
+        const string sql = @"
+            SELECT t.name, m.definition, t.is_disabled
+            FROM sys.triggers t
+            JOIN sys.sql_modules m ON m.object_id = t.object_id
+            WHERE t.parent_class = 0 AND t.is_ms_shipped = 0
+            ORDER BY t.name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Database (DDL) triggers");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = rdr.GetString(0);
+            sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.triggers WHERE parent_class = 0 AND name = {SqlNames.Literal(name)})");
+            sb.AppendLine($"    DROP TRIGGER {SqlNames.Quote(name)} ON DATABASE;");
+            sb.AppendLine("GO");
+            sb.AppendLine(rdr.GetString(1).Trim());
+            sb.AppendLine("GO");
+            if (rdr.GetBoolean(2))
+            {
+                sb.AppendLine($"DISABLE TRIGGER {SqlNames.Quote(name)} ON DATABASE;");
+                sb.AppendLine("GO");
+            }
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// Extended properties (e.g. MS_Description) on the database, schemas, objects,
+    /// columns, parameters, constraints, triggers, indexes and types, written as
+    /// update-or-add so a re-run is safe; null when there are none.
+    /// </summary>
+    public async Task<string?> ScriptExtendedPropertiesAsync()
+    {
+        const string sql = @"
+            SELECT ep.class, ep.name,
+                   CAST(ep.value AS nvarchar(4000))                      AS Value,
+                   CAST(SQL_VARIANT_PROPERTY(ep.value, 'BaseType') AS sysname) AS BaseType,
+                   SCHEMA_NAME(o.schema_id) AS ObjSchema, o.name AS ObjName, o.type AS ObjType,
+                   po.name AS ParentName, po.type AS ParentType,
+                   CASE WHEN ep.class = 1 AND ep.minor_id > 0 THEN COL_NAME(ep.major_id, ep.minor_id) END AS ColumnName,
+                   (SELECT p.name FROM sys.parameters p
+                    WHERE ep.class = 2 AND p.object_id = ep.major_id AND p.parameter_id = ep.minor_id) AS ParamName,
+                   (SELECT i.name FROM sys.indexes i
+                    WHERE ep.class = 7 AND i.object_id = ep.major_id AND i.index_id = ep.minor_id) AS IndexName,
+                   CASE WHEN ep.class = 3 THEN SCHEMA_NAME(ep.major_id) END AS SchemaName,
+                   (SELECT SCHEMA_NAME(t.schema_id) FROM sys.types t WHERE ep.class = 6 AND t.user_type_id = ep.major_id) AS TypeSchema,
+                   (SELECT t.name FROM sys.types t WHERE ep.class = 6 AND t.user_type_id = ep.major_id)                   AS TypeName
+            FROM sys.extended_properties ep
+            LEFT JOIN sys.objects o  ON ep.class IN (1, 2, 7) AND o.object_id = ep.major_id
+            LEFT JOIN sys.objects po ON po.object_id = o.parent_object_id
+            WHERE ep.class IN (0, 1, 2, 3, 6, 7)
+              AND ISNULL(o.is_ms_shipped, 0) = 0
+            ORDER BY ep.class, ObjSchema, ObjName, ColumnName, ParamName, IndexName, ep.name";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        static string? LevelType(string? objType) => objType?.Trim() switch
+        {
+            "U"                                => "TABLE",
+            "V"                                => "VIEW",
+            "P"                                => "PROCEDURE",
+            "FN" or "IF" or "TF" or "FS" or "FT" => "FUNCTION",
+            "SN"                               => "SYNONYM",
+            "SO"                               => "SEQUENCE",
+            _                                  => null
+        };
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Extended properties");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            string? Str(string col) => rdr[col] is DBNull ? null : Convert.ToString(rdr[col]);
+
+            // (level type, level name) pairs, outermost first.
+            var levels = new List<(string type, string name)>();
+            switch (Convert.ToInt32(rdr["class"]))
+            {
+                case 0:   // database
+                    break;
+                case 3:   // schema
+                    levels.Add(("SCHEMA", Str("SchemaName")!));
+                    break;
+                case 6:   // user-defined type
+                    levels.Add(("SCHEMA", Str("TypeSchema")!));
+                    levels.Add(("TYPE",   Str("TypeName")!));
+                    break;
+                default:  // 1 object/column, 2 parameter, 7 index
+                {
+                    var objType = Str("ObjType")?.Trim();
+                    levels.Add(("SCHEMA", Str("ObjSchema")!));
+                    if (objType is "C" or "D" or "F" or "PK" or "UQ" or "TR")
+                    {
+                        // constraints and triggers hang off their table or view
+                        var parentType = LevelType(Str("ParentType"));
+                        if (parentType is null) continue;
+                        levels.Add((parentType, Str("ParentName")!));
+                        levels.Add((objType == "TR" ? "TRIGGER" : "CONSTRAINT", Str("ObjName")!));
+                    }
+                    else
+                    {
+                        var levelType = LevelType(objType);
+                        if (levelType is null) continue;
+                        levels.Add((levelType, Str("ObjName")!));
+                        if (Str("ColumnName") is { } col)   levels.Add(("COLUMN",    col));
+                        if (Str("ParamName")  is { } param) levels.Add(("PARAMETER", param));
+                        if (Str("IndexName")  is { } index) levels.Add(("INDEX",     index));
+                    }
+                    break;
+                }
+            }
+
+            var name  = SqlNames.Literal(Str("name")!);
+            var raw   = Str("Value");
+            var value = raw is null ? "NULL"
+                      : Str("BaseType") is "int" or "bigint" or "smallint" or "tinyint" or "bit"
+                                        or "decimal" or "numeric" or "float" or "real"
+                        ? raw
+                        : SqlNames.Literal(raw);
+
+            // fn_listextendedproperty takes all six level arguments; unused ones are NULL.
+            var fnArgs = string.Join(", ", Enumerable.Range(0, 3).SelectMany(i => i < levels.Count
+                ? new[] { SqlNames.Literal(levels[i].type), SqlNames.Literal(levels[i].name) }
+                : new[] { "NULL", "NULL" }));
+            var procArgs = string.Concat(levels.Select((l, i) =>
+                $", @level{i}type = {SqlNames.Literal(l.type)}, @level{i}name = {SqlNames.Literal(l.name)}"));
+
+            sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.fn_listextendedproperty({name}, {fnArgs}))");
+            sb.AppendLine($"    EXEC sys.sp_updateextendedproperty @name = {name}, @value = {value}{procArgs};");
+            sb.AppendLine("ELSE");
+            sb.AppendLine($"    EXEC sys.sp_addextendedproperty @name = {name}, @value = {value}{procArgs};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>CREATE XML SCHEMA COLLECTION for every user collection, or null when there are none.</summary>
+    public async Task<string?> ScriptXmlSchemaCollectionsAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(x.schema_id), x.name,
+                   CAST(XML_SCHEMA_NAMESPACE(SCHEMA_NAME(x.schema_id), x.name) AS nvarchar(max))
+            FROM sys.xml_schema_collections x
+            WHERE x.xml_collection_id > 1   -- 1 is the built-in sys collection
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- XML schema collections");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var (schema, name) = (rdr.GetString(0), rdr.GetString(1));
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.xml_schema_collections WHERE schema_id = SCHEMA_ID({SqlNames.Literal(schema)}) AND name = {SqlNames.Literal(name)})");
+            sb.AppendLine($"    CREATE XML SCHEMA COLLECTION {SqlNames.Quote(schema, name)} AS {SqlNames.Literal(rdr.GetString(2))};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// Partition functions and schemes, or null when there are none. A scheme is
+    /// created on its original filegroups when they all exist on the target, and
+    /// otherwise ALL TO ([PRIMARY]); that choice is made when the script runs.
+    /// </summary>
+    public async Task<string?> ScriptPartitioningAsync()
+    {
+        const string sql = @"
+            SELECT pf.function_id, pf.name, pf.boundary_value_on_right,
+                   TYPE_NAME(pp.system_type_id), pp.max_length, pp.precision, pp.scale
+            FROM sys.partition_functions pf
+            JOIN sys.partition_parameters pp ON pp.function_id = pf.function_id
+            ORDER BY pf.name;
+
+            SELECT v.function_id,
+                   CAST(SQL_VARIANT_PROPERTY(v.value, 'BaseType') AS sysname),
+                   CASE WHEN SQL_VARIANT_PROPERTY(v.value, 'BaseType')
+                             IN ('date', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset', 'time')
+                        THEN CONVERT(nvarchar(4000), v.value, 126)
+                        ELSE CAST(v.value AS nvarchar(4000)) END
+            FROM sys.partition_range_values v
+            ORDER BY v.function_id, v.boundary_id;
+
+            SELECT ps.name, pf.name, ds.name
+            FROM sys.partition_schemes ps
+            JOIN sys.partition_functions pf      ON pf.function_id = ps.function_id
+            JOIN sys.destination_data_spaces dds ON dds.partition_scheme_id = ps.data_space_id
+            JOIN sys.data_spaces ds              ON ds.data_space_id = dds.data_space_id
+            ORDER BY ps.name, dds.destination_id;";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var functions = new List<(int id, string name, bool right, string type)>();
+        while (await rdr.ReadAsync())
+            functions.Add((rdr.GetInt32(0), rdr.GetString(1), rdr.GetBoolean(2),
+                           BuildTypeDef(rdr.GetString(3), rdr.GetInt16(4), rdr.GetByte(5), rdr.GetByte(6), null, null, false)));
+
+        var values = new Dictionary<int, List<string>>();
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            if (!values.TryGetValue(rdr.GetInt32(0), out var list)) values[rdr.GetInt32(0)] = list = new();
+            var isNumeric = rdr.GetString(1) is "int" or "bigint" or "smallint" or "tinyint"
+                                               or "decimal" or "numeric" or "float" or "real" or "money" or "smallmoney" or "bit";
+            list.Add(rdr.IsDBNull(2) ? "NULL" : isNumeric ? rdr.GetString(2) : SqlNames.Literal(rdr.GetString(2)));
+        }
+
+        var schemes = new List<(string name, string function, List<string> filegroups)>();
+        await rdr.NextResultAsync();
+        while (await rdr.ReadAsync())
+        {
+            if (schemes.Count == 0 || schemes[^1].name != rdr.GetString(0))
+                schemes.Add((rdr.GetString(0), rdr.GetString(1), new()));
+            schemes[^1].filegroups.Add(rdr.GetString(2));
+        }
+
+        if (functions.Count == 0 && schemes.Count == 0) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Partition functions and schemes");
+        sb.AppendLine();
+
+        foreach (var f in functions)
+        {
+            var bounds = string.Join(", ", values.GetValueOrDefault(f.id) ?? new());
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.partition_functions WHERE name = {SqlNames.Literal(f.name)})");
+            sb.AppendLine($"    CREATE PARTITION FUNCTION {SqlNames.Quote(f.name)} ({f.type})");
+            sb.AppendLine($"        AS RANGE {(f.right ? "RIGHT" : "LEFT")} FOR VALUES ({bounds});");
+            sb.AppendLine("GO");
+        }
+
+        foreach (var s in schemes)
+        {
+            var distinct  = s.filegroups.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var original  = $"CREATE PARTITION SCHEME {SqlNames.Quote(s.name)} AS PARTITION {SqlNames.Quote(s.function)} " +
+                            $"TO ({string.Join(", ", s.filegroups.Select(SqlNames.Quote))})";
+            var fallback  = $"CREATE PARTITION SCHEME {SqlNames.Quote(s.name)} AS PARTITION {SqlNames.Quote(s.function)} " +
+                            "ALL TO ([PRIMARY])";
+
+            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.partition_schemes WHERE name = {SqlNames.Literal(s.name)})");
+            sb.AppendLine("BEGIN");
+            sb.AppendLine($"    IF (SELECT COUNT(*) FROM sys.filegroups WHERE name IN ({string.Join(", ", distinct.Select(SqlNames.Literal))})) = {distinct.Count}");
+            sb.AppendLine($"        EXEC ({SqlNames.Literal(original)});");
+            sb.AppendLine("    ELSE");
+            sb.AppendLine($"        EXEC ({SqlNames.Literal(fallback)});   -- target lacks the original filegroups");
+            sb.AppendLine("END");
+            sb.AppendLine("GO");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>" ON [scheme] ([column])" for a table stored on a partition scheme, else "".</summary>
+    private static async Task<string> GetTablePlacementAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT ds.name, c.name
+            FROM sys.indexes i
+            JOIN sys.data_spaces ds    ON ds.data_space_id = i.data_space_id AND ds.type = 'PS'
+            JOIN sys.index_columns ic  ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1
+            JOIN sys.columns c         ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.object_id = @id AND i.index_id IN (0, 1)";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+        return await rdr.ReadAsync()
+            ? $" ON {SqlNames.Quote(rdr.GetString(0))} ({SqlNames.Quote(rdr.GetString(1))})"
+            : "";
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"
@@ -355,23 +809,35 @@ public class SchemaExporter
         return cols.ToDictionary(kv => kv.Key, kv => string.Join(", ", kv.Value));
     }
 
+    /// <summary>
+    /// Foreign keys, added after the data load. Keeps referential actions,
+    /// NOT FOR REPLICATION, and the trust/enabled state: an untrusted key is added
+    /// WITH NOCHECK (existing rows may violate it) and a disabled one is
+    /// disabled again. Also re-enables CHECK constraints that are enabled but
+    /// untrusted in the source; CREATE TABLE leaves those unchecked for the load.
+    /// </summary>
     public async Task<string> ScriptForeignKeysAsync()
     {
         const string sql = @"
-            SELECT fk.name,
-                   OBJECT_SCHEMA_NAME(fk.parent_object_id)      AS ParentSchema,
-                   OBJECT_NAME(fk.parent_object_id)             AS ParentTable,
-                   pc.name                                       AS ParentColumn,
-                   OBJECT_SCHEMA_NAME(fk.referenced_object_id)  AS RefSchema,
-                   OBJECT_NAME(fk.referenced_object_id)         AS RefTable,
-                   rc.name                                       AS RefColumn,
-                   fk.delete_referential_action_desc,
-                   fk.update_referential_action_desc
+            SELECT fk.object_id, fk.name,
+                   OBJECT_SCHEMA_NAME(fk.parent_object_id), OBJECT_NAME(fk.parent_object_id),
+                   OBJECT_SCHEMA_NAME(fk.referenced_object_id), OBJECT_NAME(fk.referenced_object_id),
+                   pc.name, rc.name,
+                   fk.delete_referential_action_desc, fk.update_referential_action_desc,
+                   fk.is_not_for_replication, fk.is_not_trusted, fk.is_disabled
             FROM sys.foreign_keys fk
-            JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-            JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+            JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+            JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id     AND pc.column_id = fkc.parent_column_id
             JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
-            ORDER BY ParentSchema, ParentTable, fk.name";
+            WHERE fk.is_ms_shipped = 0
+            ORDER BY 3, 4, fk.name, fkc.constraint_column_id;
+
+            SELECT OBJECT_SCHEMA_NAME(cc.parent_object_id), OBJECT_NAME(cc.parent_object_id), cc.name
+            FROM sys.check_constraints cc
+            JOIN sys.objects o ON o.object_id = cc.parent_object_id
+            WHERE o.type = 'U' AND o.is_ms_shipped = 0
+              AND cc.is_disabled = 0 AND cc.is_not_trusted = 1 AND cc.is_system_named = 0
+            ORDER BY 1, 2, 3;";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
         await using var cmd  = new SqlCommand(sql, conn);
@@ -381,104 +847,194 @@ public class SchemaExporter
         sb.AppendLine("-- Foreign Key Constraints");
         sb.AppendLine();
 
-        var fkLines = new Dictionary<string, List<(string parent, string pCol, string refSchema, string refTable, string rCol, string del, string upd)>>();
-
+        // Rows arrive one per column, grouped by key.
+        var keys = new List<(string name, string table, string refTable, List<string> cols, List<string> refCols,
+                             string del, string upd, bool notForRepl, bool notTrusted, bool disabled)>();
+        int lastId = 0;
         while (await rdr.ReadAsync())
         {
-            var fkName    = rdr.GetString(0);
-            var pSchema   = rdr.GetString(1);
-            var pTable    = rdr.GetString(2);
-            var pCol      = rdr.GetString(3);
-            var rSchema   = rdr.GetString(4);
-            var rTable    = rdr.GetString(5);
-            var rCol      = rdr.GetString(6);
-            var delAction = rdr.GetString(7);
-            var updAction = rdr.GetString(8);
-
-            var key = $"{pSchema}.{pTable}|{fkName}";
-            if (!fkLines.ContainsKey(key))
-                fkLines[key] = new();
-            fkLines[key].Add((pSchema + "." + pTable, pCol, rSchema, rTable, rCol, delAction, updAction));
+            if (rdr.GetInt32(0) != lastId)
+            {
+                lastId = rdr.GetInt32(0);
+                keys.Add((rdr.GetString(1),
+                          SqlNames.Quote(rdr.GetString(2), rdr.GetString(3)),
+                          SqlNames.Quote(rdr.GetString(4), rdr.GetString(5)),
+                          new(), new(),
+                          rdr.GetString(8).Replace('_', ' '), rdr.GetString(9).Replace('_', ' '),
+                          rdr.GetBoolean(10), rdr.GetBoolean(11), rdr.GetBoolean(12)));
+            }
+            keys[^1].cols.Add(SqlNames.Quote(rdr.GetString(6)));
+            keys[^1].refCols.Add(SqlNames.Quote(rdr.GetString(7)));
         }
 
-        foreach (var (key, cols) in fkLines)
+        foreach (var k in keys)
         {
-            var parts   = key.Split('|');
-            var fkName  = parts[1];
-            var (pFull, pCol, rSchema, rTable, rCol, del, upd) = cols[0];
-            var pParts  = pFull.Split('.');
-
-            var pColList = string.Join(", ", cols.Select(c => $"[{c.pCol}]"));
-            var rColList = string.Join(", ", cols.Select(c => $"[{c.rCol}]"));
-
-            sb.AppendLine($"IF OBJECT_ID(N'{fkName}','F') IS NULL");
-            sb.AppendLine($"ALTER TABLE [{pParts[0]}].[{pParts[1]}]");
-            sb.AppendLine($"    ADD CONSTRAINT [{fkName}]");
-            sb.AppendLine($"    FOREIGN KEY ({pColList})");
-            sb.AppendLine($"    REFERENCES [{rSchema}].[{rTable}] ({rColList})");
-            sb.AppendLine($"    ON DELETE {del.Replace("_", " ")}");
-            sb.AppendLine($"    ON UPDATE {upd.Replace("_", " ")};");
+            var name   = SqlNames.Quote(k.name);
+            var schema = k.table[..k.table.IndexOf("].[", StringComparison.Ordinal)] + "]";
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal($"{schema}.{name}")}, 'F') IS NULL");
+            sb.AppendLine($"ALTER TABLE {k.table} WITH {(k.notTrusted ? "NOCHECK" : "CHECK")}");
+            sb.AppendLine($"    ADD CONSTRAINT {name}");
+            sb.AppendLine($"    FOREIGN KEY ({string.Join(", ", k.cols)})");
+            sb.AppendLine($"    REFERENCES {k.refTable} ({string.Join(", ", k.refCols)})");
+            sb.AppendLine($"    ON DELETE {k.del}");
+            sb.AppendLine($"    ON UPDATE {k.upd}{(k.notForRepl ? "\r\n    NOT FOR REPLICATION" : "")};");
             sb.AppendLine("GO");
+            if (k.disabled)
+            {
+                sb.AppendLine($"ALTER TABLE {k.table} NOCHECK CONSTRAINT {name};");
+                sb.AppendLine("GO");
+            }
             sb.AppendLine();
+        }
+
+        await rdr.NextResultAsync();
+        var untrusted = new StringBuilder();
+        while (await rdr.ReadAsync())
+        {
+            // Without WITH CHECK the constraint is enabled for new rows but stays untrusted.
+            untrusted.AppendLine($"ALTER TABLE {SqlNames.Quote(rdr.GetString(0), rdr.GetString(1))} CHECK CONSTRAINT {SqlNames.Quote(rdr.GetString(2))};");
+            untrusted.AppendLine("GO");
+        }
+        if (untrusted.Length > 0)
+        {
+            sb.AppendLine("-- CHECK constraints enabled but not trusted in the source");
+            sb.Append(untrusted);
         }
 
         return sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE INDEX for every index on user tables and indexed views that is not
+    /// backing a PRIMARY KEY / UNIQUE constraint: key order, INCLUDE columns,
+    /// filter, options, compression and partition scheme. Clustered indexes come
+    /// first on each object so nonclustered ones are not rebuilt. XML, spatial and
+    /// hash indexes cannot be scripted yet and are listed as comments.
+    /// </summary>
     public async Task<string> ScriptIndexesAsync()
     {
-        const string sql = @"
-            SELECT OBJECT_SCHEMA_NAME(i.object_id) AS [Schema],
-                   OBJECT_NAME(i.object_id)         AS TableName,
-                   i.name                           AS IndexName,
-                   i.type_desc,
-                   i.is_unique,
-                   c.name                           AS ColumnName,
-                   ic.key_ordinal,
-                   ic.is_descending_key
+        const string indexSql = @"
+            SELECT i.object_id, i.index_id,
+                   OBJECT_SCHEMA_NAME(i.object_id), OBJECT_NAME(i.object_id),
+                   i.name, i.type, i.type_desc, i.is_unique, i.filter_definition,
+                   i.fill_factor, i.is_padded, i.ignore_dup_key, i.allow_row_locks, i.allow_page_locks,
+                   i.is_disabled,
+                   (SELECT TOP 1 p.data_compression_desc FROM sys.partitions p
+                    WHERE p.object_id = i.object_id AND p.index_id = i.index_id
+                    ORDER BY p.partition_number) AS Compression,
+                   ds.type AS DataSpaceType, ds.name AS DataSpaceName
             FROM sys.indexes i
-            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-            WHERE i.is_primary_key = 0
-              AND i.is_unique_constraint = 0
+            JOIN sys.objects o        ON o.object_id = i.object_id
+            LEFT JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
+            WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
               AND i.type > 0
-              AND ic.is_included_column = 0
-              AND OBJECTPROPERTY(i.object_id,'IsUserTable') = 1
-            ORDER BY TableName, IndexName, ic.key_ordinal";
+              AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
+              AND i.is_hypothetical = 0
+            ORDER BY 3, 4, CASE WHEN i.type IN (1, 5) THEN 0 ELSE 1 END, i.name";
+
+        const string columnSql = @"
+            SELECT ic.object_id, ic.index_id, c.name,
+                   ic.key_ordinal, ic.is_descending_key, ic.is_included_column, ic.partition_ordinal
+            FROM sys.index_columns ic
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            JOIN sys.objects o ON o.object_id = ic.object_id
+            WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
+            ORDER BY ic.object_id, ic.index_id, ic.key_ordinal, c.name";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(sql, conn);
-        await using var rdr  = await cmd.ExecuteReaderAsync();
 
-        var indexes = new Dictionary<string, (string schema, string table, string type, bool unique, List<(string col, bool desc)> cols)>();
-        while (await rdr.ReadAsync())
+        // (object_id, index_id) -> key columns, included columns, partition column
+        var cols = new Dictionary<(int, int), (List<string> keys, List<string> includes, string? partition)>();
+        await using (var cmd = new SqlCommand(columnSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
         {
-            var schema   = rdr.GetString(0);
-            var table    = rdr.GetString(1);
-            var idxName  = rdr.GetString(2);
-            var idxType  = rdr.GetString(3);
-            var isUnique = rdr.GetBoolean(4);
-            var col      = rdr.GetString(5);
-            var desc     = rdr.GetBoolean(7);
+            while (await rdr.ReadAsync())
+            {
+                var key = (rdr.GetInt32(0), rdr.GetInt32(1));
+                if (!cols.TryGetValue(key, out var entry))
+                    cols[key] = entry = (new(), new(), null);
 
-            if (!indexes.ContainsKey(idxName))
-                indexes[idxName] = (schema, table, idxType, isUnique, new());
-            indexes[idxName].cols.Add((col, desc));
+                var name = SqlNames.Quote(rdr.GetString(2));
+                if (rdr.GetBoolean(5))
+                    entry.includes.Add(name);
+                else if (rdr.GetByte(3) > 0)
+                    entry.keys.Add(name + (rdr.GetBoolean(4) ? " DESC" : " ASC"));
+                if (rdr.GetByte(6) > 0)
+                    cols[key] = entry with { partition = name };
+            }
         }
 
         var sb = new StringBuilder();
         sb.AppendLine("-- Indexes");
         sb.AppendLine();
 
-        foreach (var (name, (schema, table, type, unique, cols)) in indexes)
+        await using (var cmd = new SqlCommand(indexSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
         {
-            var colList = string.Join(", ", cols.Select(c => $"[{c.col}]{(c.desc ? " DESC" : " ASC")}"));
-            var uniqueKw = unique ? "UNIQUE " : "";
-            sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{name}' AND object_id = OBJECT_ID('[{schema}].[{table}]'))");
-            sb.AppendLine($"CREATE {uniqueKw}{type} INDEX [{name}]");
-            sb.AppendLine($"    ON [{schema}].[{table}] ({colList});");
-            sb.AppendLine("GO");
-            sb.AppendLine();
+            while (await rdr.ReadAsync())
+            {
+                var table   = SqlNames.Quote(rdr.GetString(2), rdr.GetString(3));
+                var name    = rdr.GetString(4);
+                var type    = rdr.GetByte(5);
+                var typeDsc = rdr.GetString(6);
+                cols.TryGetValue((rdr.GetInt32(0), rdr.GetInt32(1)), out var c);
+
+                if (type is 3 or 4 or 7)   // XML, SPATIAL, NONCLUSTERED HASH
+                {
+                    sb.AppendLine($"-- WARNING: {typeDsc} index {SqlNames.Quote(name)} on {table} is not supported by this tool and was not exported.");
+                    sb.AppendLine();
+                    continue;
+                }
+
+                sb.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID({SqlNames.Literal(table)}) AND name = {SqlNames.Literal(name)})");
+
+                var unique = rdr.GetBoolean(7) ? "UNIQUE " : "";
+                sb.Append($"CREATE {unique}{typeDsc} INDEX {SqlNames.Quote(name)} ON {table}");
+                if (type != 5)   // a clustered columnstore index has no column list
+                {
+                    // columnstore columns carry no sort order
+                    var keys = type == 6 ? c.includes.Concat(c.keys.Select(k => k[..k.LastIndexOf(' ')])) : c.keys;
+                    sb.Append($" ({string.Join(", ", keys)})");
+                }
+                sb.AppendLine();
+
+                if (type is 1 or 2 && c.includes is { Count: > 0 })
+                    sb.AppendLine($"    INCLUDE ({string.Join(", ", c.includes)})");
+                if (!rdr.IsDBNull(8))
+                    sb.AppendLine($"    WHERE {rdr.GetString(8)}");
+
+                var options = new List<string>();
+                if (type is 1 or 2)   // rowstore only: columnstore rejects these options
+                {
+                    var fill = rdr.GetByte(9);
+                    if (fill is > 0 and < 100)  options.Add($"FILLFACTOR = {fill}");
+                    if (rdr.GetBoolean(10))     options.Add("PAD_INDEX = ON");
+                    if (rdr.GetBoolean(11))     options.Add("IGNORE_DUP_KEY = ON");
+                    if (!rdr.GetBoolean(12))    options.Add("ALLOW_ROW_LOCKS = OFF");
+                    if (!rdr.GetBoolean(13))    options.Add("ALLOW_PAGE_LOCKS = OFF");
+                }
+                var compression = rdr.IsDBNull(15) ? "NONE" : rdr.GetString(15);
+                if (compression is "ROW" or "PAGE" or "COLUMNSTORE_ARCHIVE")
+                    options.Add($"DATA_COMPRESSION = {compression}");
+                if (options.Count > 0)
+                    sb.AppendLine($"    WITH ({string.Join(", ", options)})");
+
+                // Partitioned indexes keep their scheme; filegroups other than the
+                // target's default may not exist there, so they are not named.
+                if (!rdr.IsDBNull(16) && rdr.GetString(16) == "PS" && c.partition != null)
+                    sb.AppendLine($"    ON {SqlNames.Quote(rdr.GetString(17))} ({c.partition})");
+
+                sb.AppendLine("GO");
+
+                // A disabled clustered index would make the table unreadable, so only
+                // nonclustered indexes are re-disabled.
+                if (rdr.GetBoolean(14) && type != 1)
+                {
+                    sb.AppendLine($"ALTER INDEX {SqlNames.Quote(name)} ON {table} DISABLE;");
+                    sb.AppendLine("GO");
+                }
+                sb.AppendLine();
+            }
         }
 
         return sb.ToString();
@@ -628,7 +1184,9 @@ public class SchemaExporter
 
     /// <summary>
     /// PRIMARY KEY, UNIQUE and CHECK constraint lines for CREATE TABLE, plus the
-    /// names of CHECK constraints that are disabled in the source.
+    /// names of CHECK constraints that are disabled or untrusted in the source.
+    /// Those are switched off after CREATE TABLE so the data load cannot fail on
+    /// rows that violate them; ScriptForeignKeysAsync re-enables the untrusted ones.
     /// </summary>
     private static async Task<(List<string> lines, List<string> disabledChecks)> GetTableConstraintsAsync(
         SqlConnection conn, int objectId)
@@ -640,7 +1198,8 @@ public class SchemaExporter
             JOIN sys.indexes i ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id
             WHERE k.parent_object_id = @id
             UNION ALL
-            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition, cc.is_disabled, 2
+            SELECT 'C', cc.name, cc.is_system_named, NULL, NULL, cc.definition,
+                   cc.is_disabled | cc.is_not_trusted, 2
             FROM sys.check_constraints cc
             WHERE cc.parent_object_id = @id
             ORDER BY SortKey, 2";   // PK, UQ, then CHECK

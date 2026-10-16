@@ -360,10 +360,11 @@ public class frmBackup : Form
         var hasFunc    = selected.Any(o => o.Type == ObjectTypes.Func);
         var hasTrigger = selected.Any(o => o.Type == ObjectTypes.Trigger);
 
-        // Prerequisites (schemas, data types, table types) are always exported.
+        // Prerequisites (schemas, types, sequences, synonyms) are always exported.
         var show = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            ObjectTypes.Schema, ObjectTypes.DataType, ObjectTypes.TableType
+            ObjectTypes.Schema, ObjectTypes.XmlSchema, ObjectTypes.DataType, ObjectTypes.TableType, ObjectTypes.Partition,
+            ObjectTypes.Sequence, ObjectTypes.Synonym, ObjectTypes.DbTrigger, ObjectTypes.ExtendedProperty
         };
         if (hasTable)   { show.Add(ObjectTypes.Table); show.Add(ObjectTypes.Data); show.Add(ObjectTypes.Fk); show.Add(ObjectTypes.Index); }
         if (hasView)    show.Add(ObjectTypes.View);

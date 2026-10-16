@@ -83,19 +83,31 @@ public sealed class DbSnapshot
             """),
 
         ("sequences", """
+            -- start_value is not compared: restoring the position uses ALTER SEQUENCE ... RESTART WITH,
+            -- which also overwrites start_value. The next value (below) is what must match.
             SELECT SCHEMA_NAME(s.schema_id) + '.' + s.name, TYPE_NAME(s.user_type_id),
-                   'start=' + CAST(s.start_value AS varchar(40)),
                    'incr='  + CAST(s.increment AS varchar(40)),
                    'min='   + CAST(s.minimum_value AS varchar(40)),
                    'max='   + CAST(s.maximum_value AS varchar(40)),
                    'cycle=' + CAST(s.is_cycling AS varchar(1)),
                    'cache=' + CASE WHEN s.is_cached = 0 THEN 'none' ELSE ISNULL(CAST(s.cache_size AS varchar(20)), 'default') END,
-                   'current=' + CAST(s.current_value AS varchar(40))
+                   -- the value NEXT VALUE FOR will return (current_value alone differs after RESTART)
+                   'next=' + CAST(CASE WHEN s.last_used_value IS NULL THEN CAST(s.start_value AS decimal(38,0))
+                                       ELSE CAST(s.last_used_value AS decimal(38,0)) + CAST(s.increment AS decimal(38,0))
+                                  END AS varchar(40))
             FROM sys.sequences s
             """),
 
         ("synonyms", """
-            SELECT SCHEMA_NAME(schema_id) + '.' + name, base_object_name FROM sys.synonyms
+            -- a three-part name pointing at the database itself is shown as <this-db>, so source and target compare equal
+            SELECT SCHEMA_NAME(schema_id) + '.' + name,
+                   CASE WHEN PARSENAME(base_object_name, 4) IS NULL AND PARSENAME(base_object_name, 3) = DB_NAME()
+                        THEN '<this-db>.' + QUOTENAME(PARSENAME(base_object_name, 2)) + '.' + QUOTENAME(PARSENAME(base_object_name, 1))
+                        WHEN PARSENAME(base_object_name, 3) IS NULL
+                        THEN '<this-db>.' + base_object_name
+                        ELSE base_object_name
+                   END
+            FROM sys.synonyms
             """),
 
         ("partition_functions", """
@@ -224,7 +236,9 @@ public sealed class DbSnapshot
                          WHERE p.object_id = i.object_id AND p.index_id = i.index_id
                          ORDER BY p.partition_number) p
             WHERE i.type > 0 AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
-              AND {IsUserParent("i.object_id")}
+              AND ({IsUserParent("i.object_id")}
+                   OR EXISTS (SELECT 1 FROM sys.objects v_ WHERE v_.object_id = i.object_id
+                                AND v_.type = 'V' AND v_.is_ms_shipped = 0))   -- indexed views
             """),
 
         ("triggers", """
@@ -258,10 +272,16 @@ public sealed class DbSnapshot
                        WHEN 0 THEN 'DATABASE'
                        WHEN 1 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id)
                                    + CASE WHEN ep.minor_id > 0 THEN '.' + ISNULL(COL_NAME(ep.major_id, ep.minor_id), '?') ELSE '' END
+                       WHEN 2 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id) + '.'
+                                   + (SELECT p.name FROM sys.parameters p WHERE p.object_id = ep.major_id AND p.parameter_id = ep.minor_id)
                        WHEN 3 THEN SCHEMA_NAME(ep.major_id)
+                       WHEN 6 THEN (SELECT SCHEMA_NAME(t.schema_id) + '.' + t.name FROM sys.types t WHERE t.user_type_id = ep.major_id)
+                       WHEN 7 THEN OBJECT_SCHEMA_NAME(ep.major_id) + '.' + OBJECT_NAME(ep.major_id) + '.'
+                                   + (SELECT i.name FROM sys.indexes i WHERE i.object_id = ep.major_id AND i.index_id = ep.minor_id)
                        ELSE CAST(ep.major_id AS varchar(20)) + '/' + CAST(ep.minor_id AS varchar(20))
                    END,
-                   ep.name, CAST(ep.value AS nvarchar(4000))
+                   ep.name, CAST(ep.value AS nvarchar(4000)),
+                   CAST(SQL_VARIANT_PROPERTY(ep.value, 'BaseType') AS sysname)
             FROM sys.extended_properties ep
             """),
 

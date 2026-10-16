@@ -165,21 +165,23 @@ public class SchemaExporter
         if (string.IsNullOrWhiteSpace(def))
             return $"-- WARNING: Could not retrieve definition for {obj.FullName}\r\nGO\r\n";
 
-        // Ensure it starts with CREATE (not ALTER)
         var trimmed = def.TrimStart();
 
-        var typeLabel = obj.Type switch
+        // sys.objects type codes per object type. Functions have several: scalar,
+        // inline and multi-statement table-valued, and their CLR equivalents.
+        var typeCodes = obj.Type switch
         {
-            ObjectTypes.View    => "V",
-            ObjectTypes.Proc    => "P",
-            ObjectTypes.Func    => "FN",
-            ObjectTypes.Trigger => "TR",
-            _         => "U"
+            ObjectTypes.View    => "'V'",
+            ObjectTypes.Proc    => "'P'",
+            ObjectTypes.Func    => "'FN','IF','TF','FS','FT'",
+            ObjectTypes.Trigger => "'TR'",
+            _                   => "'U'"
         };
 
+        var name = SqlNames.Quote(obj.Schema, obj.Name);
         var sb = new StringBuilder();
         sb.AppendLine($"-- {obj.Type}: {obj.FullName}");
-        sb.AppendLine($"IF OBJECT_ID(N'[{obj.Schema}].[{obj.Name}]','{typeLabel}') IS NOT NULL");
+        sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID({SqlNames.Literal(name)}) AND type IN ({typeCodes}))");
 
         var dropType = obj.Type switch
         {
@@ -189,7 +191,7 @@ public class SchemaExporter
             ObjectTypes.Trigger => "TRIGGER",
             _         => "OBJECT"
         };
-        sb.AppendLine($"    DROP {dropType} [{obj.Schema}].[{obj.Name}]");
+        sb.AppendLine($"    DROP {dropType} {name}");
         sb.AppendLine("GO");
         sb.AppendLine(trimmed);
         sb.AppendLine("GO");

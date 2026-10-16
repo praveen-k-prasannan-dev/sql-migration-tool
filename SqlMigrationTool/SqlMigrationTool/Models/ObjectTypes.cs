@@ -19,6 +19,7 @@ public static class ObjectTypes
     public const string DataType  = "UDDT";
     public const string TableType = "UDTT";
     public const string Sequence  = "SEQUENCE";
+    public const string Synonym   = "SYNONYM";
 
     /// <summary>Display order and labels for the backup/install summary grids.</summary>
     public static readonly (string Type, string Label)[] SummaryRows =
@@ -27,6 +28,7 @@ public static class ObjectTypes
         (DataType,  "Data Types"),
         (TableType, "Table Types"),
         (Sequence,  "Sequences"),
+        (Synonym,   "Synonyms"),
         (Table,   "Tables"),
         (Data,    "Data Files"),
         (View,    "Views"),

@@ -161,6 +161,10 @@ GO
 -- ── Synonym ──────────────────────────────────────────────────────────────────
 CREATE SYNONYM dbo.Orders FOR Sales.[Order];
 GO
+-- Three-part name pointing at this same database: must be restored pointing at the target.
+DECLARE @sql NVARCHAR(400) = N'CREATE SYNONYM Audit.SelfCustomer FOR ' + QUOTENAME(DB_NAME()) + N'.dbo.Customer';
+EXEC (@sql);
+GO
 
 -- ── Functions (scalar, inline TVF, multi-statement TVF) ──────────────────────
 CREATE FUNCTION dbo.fnLineTotal (@Qty INT, @Price DECIMAL(10,2))

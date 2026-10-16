@@ -388,6 +388,43 @@ public class SchemaExporter
         return count == 0 ? null : sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE SYNONYM for every synonym, or null when there are none. A target named
+    /// with this database's own name ([ThisDb].[schema].[object]) is reduced to a
+    /// two-part name so the restored synonym points into the target database, not
+    /// back at the source.
+    /// </summary>
+    public async Task<string?> ScriptSynonymsAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   CASE WHEN PARSENAME(s.base_object_name, 4) IS NULL
+                         AND PARSENAME(s.base_object_name, 3) = DB_NAME()
+                        THEN QUOTENAME(PARSENAME(s.base_object_name, 2)) + '.' + QUOTENAME(PARSENAME(s.base_object_name, 1))
+                        ELSE s.base_object_name
+                   END
+            FROM sys.synonyms s
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Synonyms");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)}, 'SN') IS NULL");
+            sb.AppendLine($"    CREATE SYNONYM {name} FOR {rdr.GetString(2)};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"

@@ -99,7 +99,15 @@ public sealed class DbSnapshot
             """),
 
         ("synonyms", """
-            SELECT SCHEMA_NAME(schema_id) + '.' + name, base_object_name FROM sys.synonyms
+            -- a three-part name pointing at the database itself is shown as <this-db>, so source and target compare equal
+            SELECT SCHEMA_NAME(schema_id) + '.' + name,
+                   CASE WHEN PARSENAME(base_object_name, 4) IS NULL AND PARSENAME(base_object_name, 3) = DB_NAME()
+                        THEN '<this-db>.' + QUOTENAME(PARSENAME(base_object_name, 2)) + '.' + QUOTENAME(PARSENAME(base_object_name, 1))
+                        WHEN PARSENAME(base_object_name, 3) IS NULL
+                        THEN '<this-db>.' + base_object_name
+                        ELSE base_object_name
+                   END
+            FROM sys.synonyms
             """),
 
         ("partition_functions", """

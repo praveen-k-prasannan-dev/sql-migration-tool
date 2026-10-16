@@ -91,7 +91,7 @@ public static class Commands
         });
         var manifest = InstallService.LoadManifest(folder);
         Out.Info($"  Manifest version {manifest.Version}");
-        await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None, o.InstallMode);
+        await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None, o.InstallMode, o.DataMode);
         return installErrors;
     }
 

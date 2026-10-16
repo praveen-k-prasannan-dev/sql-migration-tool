@@ -18,6 +18,7 @@ public sealed class Options
     public bool    KeepTarget { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
+    public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
     public string? Folder     { get; private set; }
 
     public ConnectionConfig Config(string database) => new()
@@ -56,6 +57,7 @@ public sealed class Options
                 case "--keep-target": o.KeepTarget = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
+                case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
                 case "--folder":     o.Folder     = Next(); break;
                 default: return null;
             }
@@ -89,6 +91,7 @@ public sealed class Options
               --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
               --reinstall          roundtrip: install a second time over the populated target
               --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
+              --data-mode <m>      SkipIfNotEmpty (default) | TruncateAndLoad | Append | Upsert
               --verbose            Show every backup/install progress line
               --folder <path>      install: backup folder containing app_install.config.json
               --keep-target        install: install over the existing target instead of recreating it

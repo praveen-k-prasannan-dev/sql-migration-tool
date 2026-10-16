@@ -20,6 +20,7 @@ public class frmInstall : Form
     private Button     btnAbort        = null!;
     private Button     btnBack         = null!;
     private ComboBox   cmbScriptMode   = null!;
+    private ComboBox   cmbDataMode     = null!;
 
     private InstallManifest?          _manifest;
     private string                    _folder = "";
@@ -145,6 +146,19 @@ public class frmInstall : Form
         foreach (var mode in Enum.GetValues<ScriptMode>())
             cmbScriptMode.Items.Add(new ScriptModeItem(mode));
         content.Controls.Add(cmbScriptMode);
+
+        // Data option: what to do when a table already has rows.
+        content.Controls.Add(new Label { Text = "Data:", Location = new Point(490, y + 6), AutoSize = true });
+        cmbDataMode = new ComboBox
+        {
+            Location      = new Point(530, y + 3),
+            Width         = 260,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        foreach (var dataMode in Enum.GetValues<DataLoadMode>())
+            cmbDataMode.Items.Add(new DataLoadModeItem(dataMode));
+        cmbDataMode.SelectedIndex = 0;   // Skip tables that have rows: never touches existing data
+        content.Controls.Add(cmbDataMode);
         y += 38;
 
         // Manifest info panel
@@ -308,6 +322,7 @@ public class frmInstall : Form
             var backupMode = InstallService.ManifestMode(_manifest);
             cmbScriptMode.SelectedIndex = cmbScriptMode.Items.Cast<ScriptModeItem>().ToList().FindIndex(i => i.Mode == backupMode);
             cmbScriptMode.Enabled = true;
+            cmbDataMode.Enabled   = true;
 
             btnStart.Enabled    = true;
             lblStatus.Text      = "Manifest loaded. Ready to install.";
@@ -473,6 +488,7 @@ public class frmInstall : Form
         btnStart.Enabled  = false;
         btnLoad.Enabled   = false;
         cmbScriptMode.Enabled = false;
+        cmbDataMode.Enabled   = false;
         btnBack.Enabled   = false;
         btnAbort.Enabled  = true;
         progressBar.Value = 0;
@@ -528,7 +544,8 @@ public class frmInstall : Form
         {
             var svc = new InstallService(_cfg);
             var mode = ((ScriptModeItem)cmbScriptMode.SelectedItem!).Mode;
-            await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode);
+            var dataMode = ((DataLoadModeItem)cmbDataMode.SelectedItem!).Mode;
+            await svc.RunAsync(_folder, _manifest, progress, _cts.Token, mode, dataMode);
 
             if (errorCount == 0)
             {
@@ -563,6 +580,7 @@ public class frmInstall : Form
             btnStart.Enabled = true;
             btnLoad.Enabled  = true;
             cmbScriptMode.Enabled = true;
+            cmbDataMode.Enabled   = true;
             btnBack.Enabled  = true;
             btnAbort.Enabled = false;
             _cts?.Dispose();

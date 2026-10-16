@@ -83,14 +83,18 @@ public sealed class DbSnapshot
             """),
 
         ("sequences", """
+            -- start_value is not compared: restoring the position uses ALTER SEQUENCE ... RESTART WITH,
+            -- which also overwrites start_value. The next value (below) is what must match.
             SELECT SCHEMA_NAME(s.schema_id) + '.' + s.name, TYPE_NAME(s.user_type_id),
-                   'start=' + CAST(s.start_value AS varchar(40)),
                    'incr='  + CAST(s.increment AS varchar(40)),
                    'min='   + CAST(s.minimum_value AS varchar(40)),
                    'max='   + CAST(s.maximum_value AS varchar(40)),
                    'cycle=' + CAST(s.is_cycling AS varchar(1)),
                    'cache=' + CASE WHEN s.is_cached = 0 THEN 'none' ELSE ISNULL(CAST(s.cache_size AS varchar(20)), 'default') END,
-                   'current=' + CAST(s.current_value AS varchar(40))
+                   -- the value NEXT VALUE FOR will return (current_value alone differs after RESTART)
+                   'next=' + CAST(CASE WHEN s.last_used_value IS NULL THEN CAST(s.start_value AS decimal(38,0))
+                                       ELSE CAST(s.last_used_value AS decimal(38,0)) + CAST(s.increment AS decimal(38,0))
+                                  END AS varchar(40))
             FROM sys.sequences s
             """),
 

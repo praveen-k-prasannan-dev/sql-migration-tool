@@ -285,6 +285,109 @@ public class SchemaExporter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE SEQUENCE for every sequence with its original definition (START WITH is
+    /// the original start value), or null when there are none. The current position
+    /// is restored after the data load by <see cref="ScriptSequenceRestartsAsync"/>.
+    /// </summary>
+    public async Task<string?> ScriptSequencesAsync()
+    {
+        const string sql = @"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   ty.is_user_defined, SCHEMA_NAME(ty.schema_id), ty.name, TYPE_NAME(s.system_type_id),
+                   s.precision, s.scale,
+                   CAST(s.start_value   AS varchar(40)), CAST(s.increment     AS varchar(40)),
+                   CAST(s.minimum_value AS varchar(40)), CAST(s.maximum_value AS varchar(40)),
+                   s.is_cycling, s.is_cached, s.cache_size
+            FROM sys.sequences s
+            JOIN sys.types ty ON ty.user_type_id = s.user_type_id
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Sequences");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            var type = rdr.GetBoolean(2)
+                ? SqlNames.Quote(rdr.GetString(3), rdr.GetString(4))
+                : BuildTypeDef(rdr.GetString(5), 0, rdr.GetByte(6), rdr.GetByte(7), null, null, false);
+            var cache = !rdr.GetBoolean(13) ? "NO CACHE"
+                      : rdr.IsDBNull(14)    ? "CACHE"
+                      : $"CACHE {rdr.GetInt32(14)}";
+
+            sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)}, 'SO') IS NULL");
+            sb.AppendLine($"    CREATE SEQUENCE {name} AS {type}");
+            sb.AppendLine($"        START WITH {rdr.GetString(8)} INCREMENT BY {rdr.GetString(9)}");
+            sb.AppendLine($"        MINVALUE {rdr.GetString(10)} MAXVALUE {rdr.GetString(11)}");
+            sb.AppendLine($"        {(rdr.GetBoolean(12) ? "CYCLE" : "NO CYCLE")} {cache};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
+    /// <summary>
+    /// ALTER SEQUENCE ... RESTART WITH the source's next value for every sequence
+    /// that has been used, so the target continues where the source left off;
+    /// null when no sequence needs it.
+    /// </summary>
+    public async Task<string?> ScriptSequenceRestartsAsync()
+    {
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        // last_used_value exists from SQL Server 2017; before that current_value is the best available.
+        await using var probe = new SqlCommand("SELECT COL_LENGTH('sys.sequences', 'last_used_value')", conn);
+        var lastUsed = await probe.ExecuteScalarAsync() is DBNull or null ? "s.current_value" : "s.last_used_value";
+
+        var sql = $@"
+            SELECT SCHEMA_NAME(s.schema_id), s.name,
+                   CAST({lastUsed}       AS decimal(38,0)),
+                   CAST(s.increment     AS decimal(38,0)),
+                   CAST(s.minimum_value AS decimal(38,0)),
+                   CAST(s.maximum_value AS decimal(38,0)),
+                   s.is_cycling
+            FROM sys.sequences s
+            ORDER BY 1, 2";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- Sequences: continue from the source's next value");
+        sb.AppendLine();
+        int count = 0;
+        while (await rdr.ReadAsync())
+        {
+            if (rdr.IsDBNull(2)) continue;   // never used: START WITH is already correct
+
+            var name = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
+            decimal last = rdr.GetDecimal(2), incr = rdr.GetDecimal(3),
+                    min  = rdr.GetDecimal(4), max  = rdr.GetDecimal(5);
+            var next = last + incr;
+
+            if (next > max || next < min)
+            {
+                if (!rdr.GetBoolean(6))
+                {
+                    sb.AppendLine($"-- {name} is exhausted in the source (no CYCLE); left at its start value.");
+                    continue;
+                }
+                next = incr > 0 ? min : max;
+            }
+
+            sb.AppendLine($"ALTER SEQUENCE {name} RESTART WITH {next};");
+            sb.AppendLine("GO");
+            count++;
+        }
+        return count == 0 ? null : sb.ToString();
+    }
+
     private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
     {
         const string sql = @"

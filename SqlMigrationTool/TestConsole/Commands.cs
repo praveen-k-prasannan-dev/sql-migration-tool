@@ -36,7 +36,7 @@ public static class Commands
             if (p.Success == false) { backupFailures++; Out.Error("  " + p.Message); }
             else if (o.Verbose)     Out.Info("  " + p.Message);
         });
-        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None, o.Mode);
+        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None, o.Mode, o.Cleanup);
         Out.Info($"  Script mode: {o.Mode}");
         Out.Info($"  Backup folder: {folder}");
 

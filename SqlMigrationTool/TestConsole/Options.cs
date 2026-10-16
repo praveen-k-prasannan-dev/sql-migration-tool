@@ -16,6 +16,7 @@ public sealed class Options
     public bool    Verbose    { get; private set; }
     public bool    Reinstall  { get; private set; }
     public bool    KeepTarget { get; private set; }
+    public bool    Cleanup    { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
@@ -55,6 +56,7 @@ public sealed class Options
                 case "--verbose":    o.Verbose    = true; break;
                 case "--reinstall":  o.Reinstall  = true; break;
                 case "--keep-target": o.KeepTarget = true; break;
+                case "--cleanup":    o.Cleanup    = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
@@ -90,6 +92,7 @@ public sealed class Options
               --skip-setup         roundtrip: use the existing source database as-is
               --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
               --reinstall          roundtrip: install a second time over the populated target
+              --cleanup            roundtrip: also write the cleanup (drop-all) script
               --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
               --data-mode <m>      SkipIfNotEmpty (default) | TruncateAndLoad | Append | Upsert
               --verbose            Show every backup/install progress line

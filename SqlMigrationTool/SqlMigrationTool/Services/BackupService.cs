@@ -27,7 +27,8 @@ public class BackupService
         int                       chunkSize,
         IProgress<BackupProgress> progress,
         CancellationToken         ct,
-        ScriptMode                mode = ScriptMode.DropAndCreate)
+        ScriptMode                mode = ScriptMode.DropAndCreate,
+        bool                      writeCleanupScript = false)
     {
         _mode = mode;
         Directory.CreateDirectory(outputFolder);
@@ -197,6 +198,14 @@ public class BackupService
 
         var manifestPath = Path.Combine(outputFolder, "app_install.config.json");
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, _jsonOptions), ct);
+
+        // Optional drop-everything script for a target; never part of the install.
+        if (writeCleanupScript)
+        {
+            var cleanup = await CleanupScriptBuilder.BuildAsync(_cfg, tables, orderedProgrammable, triggers);
+            await File.WriteAllTextAsync(Path.Combine(outputFolder, CleanupScriptBuilder.FileName), cleanup, ct);
+            progress.Report(new BackupProgress($"✔ Cleanup script written: {CleanupScriptBuilder.FileName} (inert until edited; see its header)"));
+        }
 
         progress.Report(new BackupProgress($"✔ Backup complete. {manifest.Summary.TotalFiles} files written."));
         progress.Report(new BackupProgress($"  Manifest: {manifestPath}"));

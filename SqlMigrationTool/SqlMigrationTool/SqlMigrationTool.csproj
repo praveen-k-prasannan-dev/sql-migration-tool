@@ -19,6 +19,8 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PublishSingleFile>false</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
+    <!-- The UI is English only: skip the framework's localized resource assemblies (cs, de, es, ...). -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>

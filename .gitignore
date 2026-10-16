@@ -35,3 +35,6 @@ TestResults/
 # (Connection profiles are stored in %AppData%, not in the repo)
 *.secret
 appsettings.Local.json
+
+# ── MSIX build output ────────────────────────────────────────────────────────
+SqlMigrationTool/Packaging/out/

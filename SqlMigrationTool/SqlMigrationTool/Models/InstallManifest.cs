@@ -13,6 +13,8 @@ public class InstallManifest
     public string              SourceDatabase        { get; set; } = "";
     public int                 SqlCompatibilityLevel { get; set; } = 160;
     public string?             DatabaseCollation     { get; set; }
+    /// <summary>ScriptMode the scripts were written with; the default for installing. Absent (v1): DropAndCreate.</summary>
+    public string              ScriptMode            { get; set; } = nameof(Models.ScriptMode.DropAndCreate);
     public List<ManifestPhase> Phases                { get; set; } = new();
     public ManifestSummary     Summary               { get; set; } = new();
 }

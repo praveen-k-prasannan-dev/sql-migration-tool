@@ -1,4 +1,5 @@
 using TestConsole;
+using SqlMigrationTool.Models;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
@@ -17,6 +18,7 @@ try
         "roundtrip" => await Commands.RoundTripAsync(opts),
         "compare"   => await Commands.CompareAsync(opts),
         "install"   => await Commands.InstallAsync(opts),
+        "rewrapcheck" => await Commands.RewrapCheckAsync(opts),
         _           => 2
     };
 }

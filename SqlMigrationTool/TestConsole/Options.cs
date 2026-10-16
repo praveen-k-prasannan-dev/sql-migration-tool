@@ -14,6 +14,13 @@ public sealed class Options
     public int     ChunkSize  { get; private set; } = 2;   // small on purpose: exercises chunk paging
     public bool    SkipSetup  { get; private set; }
     public bool    Verbose    { get; private set; }
+    public bool    Reinstall  { get; private set; }
+    public bool    KeepTarget { get; private set; }
+    public bool    Cleanup    { get; private set; }
+    public bool    Preview    { get; private set; }
+    public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
+    public ScriptMode? InstallMode { get; private set; }
+    public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
     public string? Folder     { get; private set; }
 
     public ConnectionConfig Config(string database) => new()
@@ -31,7 +38,7 @@ public sealed class Options
         if (args.Length == 0) return null;
 
         var o = new Options { Command = args[0].ToLowerInvariant() };
-        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install")) return null;
+        if (o.Command is not ("setup" or "roundtrip" or "compare" or "install" or "rewrapcheck")) return null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -48,6 +55,13 @@ public sealed class Options
                 case "--chunk":      o.ChunkSize  = int.Parse(Next()); break;
                 case "--skip-setup": o.SkipSetup  = true; break;
                 case "--verbose":    o.Verbose    = true; break;
+                case "--reinstall":  o.Reinstall  = true; break;
+                case "--keep-target": o.KeepTarget = true; break;
+                case "--cleanup":    o.Cleanup    = true; break;
+                case "--preview":    o.Preview    = true; break;
+                case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
+                case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
+                case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
                 case "--folder":     o.Folder     = Next(); break;
                 default: return null;
             }
@@ -67,6 +81,7 @@ public sealed class Options
               roundtrip   setup + back up source + install into a fresh target + compare
               compare     Compare source and target databases only
               install     Install an existing backup (--folder) into a fresh target
+              rewrapcheck Back up in every mode and check re-wrapping between modes is exact
 
             Options:
               --server <name>      SQL Server instance (default: .)
@@ -77,8 +92,15 @@ public sealed class Options
               --script <path>      Test database script (default: TestData/full_feature_db.sql)
               --chunk <rows>       Backup chunk size (default: 2)
               --skip-setup         roundtrip: use the existing source database as-is
+              --mode <mode>        roundtrip: script mode DropAndCreate | CreateOnly | CreateOrAlter
+              --reinstall          roundtrip: install a second time over the populated target
+              --cleanup            roundtrip: also write the cleanup (drop-all) script
+              --install-mode <m>   install with this mode instead of the backup's (re-wraps scripts)
+              --data-mode <m>      SkipIfNotEmpty (default) | TruncateAndLoad | Append | Upsert
               --verbose            Show every backup/install progress line
               --folder <path>      install: backup folder containing app_install.config.json
+              --keep-target        install: install over the existing target instead of recreating it
+              --preview            install: write preview_install.sql only; execute nothing
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

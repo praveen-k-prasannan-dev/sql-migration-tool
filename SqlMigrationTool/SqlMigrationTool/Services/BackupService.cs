@@ -11,7 +11,8 @@ public class BackupService
 
     private static readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
 
-    private int _order;   // manifest order and file number, shared by all phases
+    private int        _order;   // manifest order and file number, shared by all phases
+    private ScriptMode _mode;    // how scripts treat objects that already exist on the target
 
     public BackupService(ConnectionConfig cfg)
     {
@@ -25,8 +26,11 @@ public class BackupService
         List<DatabaseObject>      selectedObjects,
         int                       chunkSize,
         IProgress<BackupProgress> progress,
-        CancellationToken         ct)
+        CancellationToken         ct,
+        ScriptMode                mode = ScriptMode.DropAndCreate,
+        bool                      writeCleanupScript = false)
     {
+        _mode = mode;
         Directory.CreateDirectory(outputFolder);
 
         var manifest = new InstallManifest
@@ -35,7 +39,8 @@ public class BackupService
             SourceServer          = _cfg.Server,
             SourceDatabase        = _cfg.Database,
             SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync(),
-            DatabaseCollation     = await _schema.GetDatabaseCollationAsync()
+            DatabaseCollation     = await _schema.GetDatabaseCollationAsync(),
+            ScriptMode            = mode.ToString()
         };
 
         _order = 1;
@@ -52,7 +57,7 @@ public class BackupService
             new(ObjectTypes.Schema,    "schemas",                  "Schemas",                  _schema.ScriptSchemasAsync),
             new(ObjectTypes.XmlSchema, "xml_schema_collections",   "XML Schema Collections",   _schema.ScriptXmlSchemaCollectionsAsync),
             new(ObjectTypes.DataType,  "user_defined_data_types",  "User-Defined Data Types",  _schema.ScriptDataTypesAsync),
-            new(ObjectTypes.TableType, "user_defined_table_types", "User-Defined Table Types", _schema.ScriptTableTypesAsync),
+            new(ObjectTypes.TableType, "user_defined_table_types", "User-Defined Table Types", () => _schema.ScriptTableTypesAsync(_mode)),
             new(ObjectTypes.Partition, "partitioning",             "Partition Functions/Schemes", _schema.ScriptPartitioningAsync),
             new(ObjectTypes.Sequence,  "sequences",                "Sequences",                _schema.ScriptSequencesAsync),
             // Synonyms bind late, so they can be created before their target objects.
@@ -194,6 +199,14 @@ public class BackupService
         var manifestPath = Path.Combine(outputFolder, "app_install.config.json");
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(manifest, _jsonOptions), ct);
 
+        // Optional drop-everything script for a target; never part of the install.
+        if (writeCleanupScript)
+        {
+            var cleanup = await CleanupScriptBuilder.BuildAsync(_cfg, tables, orderedProgrammable, triggers);
+            await File.WriteAllTextAsync(Path.Combine(outputFolder, CleanupScriptBuilder.FileName), cleanup, ct);
+            progress.Report(new BackupProgress($"✔ Cleanup script written: {CleanupScriptBuilder.FileName} (inert until edited; see its header)"));
+        }
+
         progress.Report(new BackupProgress($"✔ Backup complete. {manifest.Summary.TotalFiles} files written."));
         progress.Report(new BackupProgress($"  Manifest: {manifestPath}"));
     }
@@ -253,7 +266,7 @@ public class BackupService
         {
             ct.ThrowIfCancellationRequested();
             progress.Report(new BackupProgress($"  > Scripting TRIGGER {trig.FullName}"));
-            sb.AppendLine(await _schema.ScriptTriggerAsync(trig));
+            sb.AppendLine(await _schema.ScriptModuleAsync(trig, _mode));
         }
         return sb.ToString();
     }
@@ -264,10 +277,9 @@ public class BackupService
 
     private Task<string> ScriptObjectAsync(DatabaseObject obj) => obj.Type switch
     {
-        ObjectTypes.Table => _schema.ScriptTableAsync(obj),
-        ObjectTypes.View  => _schema.ScriptViewAsync(obj),
-        ObjectTypes.Func  => _schema.ScriptFuncAsync(obj),
-        ObjectTypes.Proc  => _schema.ScriptProcAsync(obj),
+        ObjectTypes.Table => _schema.ScriptTableAsync(obj, _mode),
+        ObjectTypes.View or ObjectTypes.Func or ObjectTypes.Proc
+                          => _schema.ScriptModuleAsync(obj, _mode),
         _ => throw new NotSupportedException($"No scripter for object type {obj.Type}")
     };
 

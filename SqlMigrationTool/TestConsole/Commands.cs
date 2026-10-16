@@ -36,10 +36,16 @@ public static class Commands
             if (p.Success == false) { backupFailures++; Out.Error("  " + p.Message); }
             else if (o.Verbose)     Out.Info("  " + p.Message);
         });
-        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None);
+        await new BackupService(source).RunAsync(folder, objects, o.ChunkSize, backupProgress, CancellationToken.None, o.Mode, o.Cleanup);
+        Out.Info($"  Script mode: {o.Mode}");
         Out.Info($"  Backup folder: {folder}");
 
         var installErrors = await InstallCoreAsync(o, folder);
+        if (o.Reinstall)
+        {
+            Out.Step("Re-installing over the populated target");
+            installErrors += await InstallCoreAsync(o, folder);
+        }
 
         // ── Compare ─────────────────────────────────────────────────────────
         var differences = await CompareCoreAsync(o);
@@ -57,8 +63,20 @@ public static class Commands
     {
         if (o.Folder is null) throw new ArgumentException("install needs --folder <backup folder>");
 
-        Out.Step($"Recreating empty target {o.TargetDb}");
-        await TestDatabase.RecreateAsync(o, o.TargetDb);
+        if (o.Preview)
+        {
+            var path = await new InstallService(o.Config(o.TargetDb)).PreviewAsync(
+                o.Folder, InstallService.LoadManifest(o.Folder), new SyncProgress<InstallProgress>(_ => { }),
+                CancellationToken.None, o.InstallMode, o.DataMode);
+            Out.Ok($"Preview written: {path}");
+            return 0;
+        }
+
+        if (!o.KeepTarget)
+        {
+            Out.Step($"Recreating empty target {o.TargetDb}");
+            await TestDatabase.RecreateAsync(o, o.TargetDb);
+        }
         var installErrors = await InstallCoreAsync(o, o.Folder);
         Report("Install errors", installErrors);
         return installErrors == 0 ? 0 : 1;
@@ -75,13 +93,57 @@ public static class Commands
                 installErrors++;
                 Out.Error($"  {p.Entry.Type} {p.Entry.Object} ({p.Entry.File}): {p.Message}");
             }
+            else if (p.Status == InstallStatus.Warning)
+                Out.Warn($"  ! {p.Entry.Type} {p.Entry.Object}: {p.Message}");
             else if (o.Verbose && p.Status == InstallStatus.Done)
                 Out.Info($"  ✔ {p.Entry.Type} {p.Entry.Object}");
         });
         var manifest = InstallService.LoadManifest(folder);
         Out.Info($"  Manifest version {manifest.Version}");
-        await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None);
+        await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None, o.InstallMode, o.DataMode);
         return installErrors;
+    }
+
+    /// <summary>
+    /// Backs the source up once per script mode, then re-wraps every script of each
+    /// backup into every other mode and requires the result to equal the script that
+    /// backup in that mode produced directly.
+    /// </summary>
+    public static async Task<int> RewrapCheckAsync(Options o)
+    {
+        var source  = o.Config(o.SourceDb);
+        var objects = await new SchemaExporter(source).ListAllObjectsAsync();
+        var root    = Path.Combine(Path.GetTempPath(), "SqlMigTest", "rewrap_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+        var modes   = Enum.GetValues<ScriptMode>();
+        var quiet   = new SyncProgress<BackupProgress>(_ => { });
+
+        foreach (var mode in modes)
+            await new BackupService(source).RunAsync(Path.Combine(root, mode.ToString()), objects, o.ChunkSize, quiet, CancellationToken.None, mode);
+
+        int checkedFiles = 0, failures = 0;
+        foreach (var from in modes)
+        foreach (var to in modes.Where(m => m != from))
+        {
+            var fromDir = Path.Combine(root, from.ToString());
+            foreach (var file in Directory.GetFiles(fromDir, "*.sql", SearchOption.AllDirectories))
+            {
+                var text = await File.ReadAllTextAsync(file);
+                if (!ScriptWrapper.IsWrapped(text)) continue;
+
+                var expected = await File.ReadAllTextAsync(Path.Combine(root, to.ToString(), Path.GetRelativePath(fromDir, file)));
+                checkedFiles++;
+                if (ScriptWrapper.Rewrap(text, to) != expected)
+                {
+                    failures++;
+                    Out.Error($"  {from} -> {to}: {Path.GetRelativePath(fromDir, file)} differs");
+                }
+            }
+        }
+
+        Out.Info($"  Re-wrapped files checked: {checkedFiles}");
+        Report("Differing", failures);
+        Out.Info($"  Backups: {root}");
+        return failures == 0 && checkedFiles > 0 ? 0 : 1;
     }
 
     public static async Task<int> CompareAsync(Options o)

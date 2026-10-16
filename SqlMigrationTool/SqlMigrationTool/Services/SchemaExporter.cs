@@ -105,98 +105,68 @@ public class SchemaExporter
 
     // ── Script generation ───────────────────────────────────────────────────
 
-    public async Task<string> ScriptTableAsync(DatabaseObject tbl)
+    /// <summary>CREATE TABLE with columns, keys and CHECK constraints, wrapped for <paramref name="mode"/>.</summary>
+    public async Task<string> ScriptTableAsync(DatabaseObject tbl, ScriptMode mode)
     {
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
         var objectId = await GetObjectIdAsync(conn, tbl.Schema, tbl.Name);
-        var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
-        var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
-        lines.AddRange(constraints);
+        var columns  = await GetColumnDefsAsync(conn, objectId, forTableType: false);
+        var (constraints, uncheckedChecks) = await GetTableConstraintsAsync(conn, objectId);
         var placement = await GetTablePlacementAsync(conn, objectId);
 
-        var name = SqlNames.Quote(tbl.Schema, tbl.Name);
-        var sb = new StringBuilder();
-        sb.AppendLine($"-- Table: {tbl.FullName}");
-        sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)},'U') IS NOT NULL");
-        sb.AppendLine($"    DROP TABLE {name}");
-        sb.AppendLine("GO");
-        sb.AppendLine($"CREATE TABLE {name} (");
-        sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
-        sb.AppendLine(")" + placement);
-        sb.AppendLine("GO");
+        var lines = columns.Select(c => c.Definition).Concat(constraints);
+        var body  = $"CREATE TABLE {SqlNames.Quote(tbl.Schema, tbl.Name)} (\r\n" +
+                    string.Join(",\r\n", lines.Select(l => $"    {l}")) +
+                    $"\r\n){placement}";
 
-        foreach (var check in disabledChecks)
+        var info = new ScriptObjectInfo
         {
-            sb.AppendLine($"ALTER TABLE {name} NOCHECK CONSTRAINT {SqlNames.Quote(check)}");
-            sb.AppendLine("GO");
-        }
-        return sb.ToString();
+            Type            = ObjectTypes.Table,
+            Schema          = tbl.Schema,
+            Name            = tbl.Name,
+            SysType         = "U",
+            Columns         = columns,
+            UncheckedChecks = uncheckedChecks.Count > 0 ? uncheckedChecks : null
+        };
+        return ScriptWrapper.Wrap(info, body, mode);
     }
 
-    public async Task<string> ScriptViewAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "V");
-    public async Task<string> ScriptProcAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "P");
-    public async Task<string> ScriptFuncAsync(DatabaseObject obj)    => await ScriptDefinitionObject(obj, "FN,IF,TF");
-    /// <summary>Table/view trigger; re-disabled after creation when disabled in the source.</summary>
-    public async Task<string> ScriptTriggerAsync(DatabaseObject obj)
+    /// <summary>
+    /// A view, procedure, function or trigger, wrapped for <paramref name="mode"/>
+    /// (see <see cref="ScriptWrapper"/>). Disabled triggers are re-disabled.
+    /// </summary>
+    public async Task<string> ScriptModuleAsync(DatabaseObject obj, ScriptMode mode)
     {
-        var script = await ScriptDefinitionObject(obj, "TR");
+        const string sql = @"
+            SELECT o.type, OBJECT_DEFINITION(o.object_id),
+                   OBJECT_SCHEMA_NAME(o.parent_object_id), OBJECT_NAME(o.parent_object_id), p.type,
+                   CAST(ISNULL(t.is_disabled, 0) AS bit)
+            FROM sys.objects o
+            LEFT JOIN sys.objects  p ON p.object_id = o.parent_object_id
+            LEFT JOIN sys.triggers t ON t.object_id = o.object_id
+            WHERE o.object_id = OBJECT_ID(@n)";
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(@"
-            SELECT OBJECT_SCHEMA_NAME(t.parent_id), OBJECT_NAME(t.parent_id)
-            FROM sys.triggers t
-            WHERE t.object_id = OBJECT_ID(@n) AND t.is_disabled = 1", conn);
+        await using var cmd  = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@n", SqlNames.Quote(obj.Schema, obj.Name));
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        if (!await rdr.ReadAsync()) return script;
+        await using var rdr  = await cmd.ExecuteReaderAsync();
 
-        var parent = SqlNames.Quote(rdr.GetString(0), rdr.GetString(1));
-        return script + $"DISABLE TRIGGER {SqlNames.Quote(obj.Schema, obj.Name)} ON {parent};\r\nGO\r\n";
-    }
+        if (!await rdr.ReadAsync() || rdr.IsDBNull(1))
+            return $"-- WARNING: Could not retrieve definition for {obj.FullName} (encrypted or missing)\r\nGO\r\n";
 
-    private async Task<string> ScriptDefinitionObject(DatabaseObject obj, string typeCode)
-    {
-        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-        await using var cmd  = new SqlCommand(
-            "SELECT OBJECT_DEFINITION(OBJECT_ID(@n))", conn);
-        cmd.Parameters.AddWithValue("@n", obj.FullName);
-
-        var def = (string?)await cmd.ExecuteScalarAsync();
-        if (string.IsNullOrWhiteSpace(def))
-            return $"-- WARNING: Could not retrieve definition for {obj.FullName}\r\nGO\r\n";
-
-        var trimmed = def.TrimStart();
-
-        // sys.objects type codes per object type. Functions have several: scalar,
-        // inline and multi-statement table-valued, and their CLR equivalents.
-        var typeCodes = obj.Type switch
+        var info = new ScriptObjectInfo
         {
-            ObjectTypes.View    => "'V'",
-            ObjectTypes.Proc    => "'P'",
-            ObjectTypes.Func    => "'FN','IF','TF','FS','FT'",
-            ObjectTypes.Trigger => "'TR'",
-            _                   => "'U'"
+            Type          = obj.Type,
+            Schema        = obj.Schema,
+            Name          = obj.Name,
+            SysType       = rdr.GetString(0).Trim(),
+            ParentSchema  = rdr.IsDBNull(2) ? null : rdr.GetString(2),
+            ParentName    = rdr.IsDBNull(3) ? null : rdr.GetString(3),
+            ParentSysType = rdr.IsDBNull(4) ? null : rdr.GetString(4).Trim(),
+            Disabled      = rdr.GetBoolean(5)
         };
-
-        var name = SqlNames.Quote(obj.Schema, obj.Name);
-        var sb = new StringBuilder();
-        sb.AppendLine($"-- {obj.Type}: {obj.FullName}");
-        sb.AppendLine($"IF EXISTS (SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID({SqlNames.Literal(name)}) AND type IN ({typeCodes}))");
-
-        var dropType = obj.Type switch
-        {
-            ObjectTypes.View    => "VIEW",
-            ObjectTypes.Proc    => "PROCEDURE",
-            ObjectTypes.Func    => "FUNCTION",
-            ObjectTypes.Trigger => "TRIGGER",
-            _         => "OBJECT"
-        };
-        sb.AppendLine($"    DROP {dropType} {name}");
-        sb.AppendLine("GO");
-        sb.AppendLine(trimmed);
-        sb.AppendLine("GO");
-        return sb.ToString();
+        return ScriptWrapper.Wrap(info, rdr.GetString(1), mode);
     }
 
     // ── Prerequisites ───────────────────────────────────────────────────────
@@ -265,9 +235,11 @@ public class SchemaExporter
     /// <summary>
     /// CREATE TYPE ... AS TABLE for every user-defined table type, with its columns,
     /// PRIMARY KEY / UNIQUE / CHECK constraints and inline indexes; null when there are none.
-    /// Constraint names are omitted because table types do not allow them.
+    /// Constraint names are omitted because table types do not allow them. Each type
+    /// is wrapped for <paramref name="mode"/> with its column signature, so a changed
+    /// type on the target is detected (see ScriptWrapper).
     /// </summary>
-    public async Task<string?> ScriptTableTypesAsync()
+    public async Task<string?> ScriptTableTypesAsync(ScriptMode mode)
     {
         const string typesSql = @"
             SELECT SCHEMA_NAME(tt.schema_id), tt.name, tt.type_table_object_id, tt.is_memory_optimized
@@ -291,15 +263,24 @@ public class SchemaExporter
 
         foreach (var (schema, name, objectId, memoryOptimized) in types)
         {
-            var lines = await GetColumnDefsAsync(conn, objectId, forTableType: true);
+            var lines = (await GetColumnDefsAsync(conn, objectId, forTableType: true)).Select(c => c.Definition).ToList();
             lines.AddRange(await GetTableTypeConstraintsAsync(conn, objectId));
 
             var fullName = SqlNames.Quote(schema, name);
-            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(fullName)}) IS NULL");
-            sb.AppendLine($"    CREATE TYPE {fullName} AS TABLE (");
-            sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"        {l}")));
-            sb.AppendLine(memoryOptimized ? "    ) WITH (MEMORY_OPTIMIZED = ON);" : "    );");
-            sb.AppendLine("GO");
+            await using var sigCmd = new SqlCommand($"SELECT {ScriptWrapper.TableTypeSignatureSql(fullName)}", conn);
+
+            var body = $"CREATE TYPE {fullName} AS TABLE (\r\n" +
+                       string.Join(",\r\n", lines.Select(l => $"    {l}")) +
+                       (memoryOptimized ? "\r\n) WITH (MEMORY_OPTIMIZED = ON)" : "\r\n)");
+            var info = new ScriptObjectInfo
+            {
+                Type      = ObjectTypes.TableType,
+                Schema    = schema,
+                Name      = name,
+                SysType   = "TT",
+                Signature = await sigCmd.ExecuteScalarAsync() as string
+            };
+            sb.Append(ScriptWrapper.Wrap(info, body, mode));
         }
         return sb.ToString();
     }
@@ -1048,7 +1029,7 @@ public class SchemaExporter
     /// Named defaults keep their names except inside table types, where constraint
     /// names are not allowed.
     /// </summary>
-    private static async Task<List<string>> GetColumnDefsAsync(
+    private static async Task<List<ColumnInfo>> GetColumnDefsAsync(
         SqlConnection conn, int objectId, bool forTableType)
     {
         const string sql = @"
@@ -1086,12 +1067,23 @@ public class SchemaExporter
         await using var cmd = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@id", objectId);
 
-        var defs = new List<string>();
+        var defs = new List<ColumnInfo>();
         await using var rdr = await cmd.ExecuteReaderAsync();
         while (await rdr.ReadAsync())
         {
             string? Str(string col)  => rdr[col] is DBNull ? null : (string)rdr[col];
             bool    Bool(string col) => rdr[col] is bool b && b;
+            ColumnInfo Column(string definition) => new()
+            {
+                Name       = rdr.GetString(0),
+                Definition = definition,
+                TypeName   = rdr.GetString(1),
+                MaxLength  = Convert.ToInt32(rdr["max_length"]),
+                Precision  = Convert.ToInt32(rdr["precision"]),
+                Scale      = Convert.ToInt32(rdr["scale"]),
+                Nullable   = Bool("is_nullable"),
+                Computed   = Str("ComputedDef") != null
+            };
 
             var colName = SqlNames.Quote(rdr.GetString(0));
 
@@ -1101,7 +1093,7 @@ public class SchemaExporter
                 var persisted = Bool("is_persisted")
                     ? " PERSISTED" + (Bool("is_nullable") ? "" : " NOT NULL")
                     : "";
-                defs.Add($"{colName} AS {computedDef}{persisted}");
+                defs.Add(Column($"{colName} AS {computedDef}{persisted}"));
                 continue;
             }
 
@@ -1140,7 +1132,7 @@ public class SchemaExporter
                 sb.Append($" DEFAULT {defaultDef}");
             }
 
-            defs.Add(sb.ToString());
+            defs.Add(Column(sb.ToString()));
         }
         return defs;
     }

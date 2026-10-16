@@ -15,38 +15,139 @@ public class InstallService
 
     public InstallService(ConnectionConfig cfg) => _cfg = cfg;
 
+    /// <summary>A script as it will run: re-wrapped when a different mode was chosen.</summary>
+    private async Task<string> ReadScriptAsync(string filePath, CancellationToken ct)
+    {
+        var content = await File.ReadAllTextAsync(filePath, ct);
+        return _rewrapTo is { } mode && ScriptWrapper.IsWrapped(content)
+            ? ScriptWrapper.Rewrap(content, mode)
+            : content;
+    }
+
+    public const string PreviewFileName = "preview_install.sql";
+
+    /// <summary>
+    /// Writes every script, exactly as the install would run it, to
+    /// preview_install.sql in the backup folder, and notes how each data file would
+    /// be loaded. Nothing is executed and the target is not contacted.
+    /// </summary>
+    public async Task<string> PreviewAsync(
+        string                     folder,
+        InstallManifest            manifest,
+        IProgress<InstallProgress> progress,
+        CancellationToken          ct,
+        ScriptMode?                mode     = null,
+        DataLoadMode               dataMode = DataLoadMode.SkipIfNotEmpty)
+    {
+        var effective = mode ?? ManifestMode(manifest);
+        _rewrapTo = effective != ManifestMode(manifest) ? effective : null;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine("-- SQL Migration Tool - INSTALL PREVIEW (nothing below has been executed)");
+        sb.AppendLine($"-- Backup:      {manifest.SourceServer} / {manifest.SourceDatabase} ({manifest.Created})");
+        sb.AppendLine($"-- Target:      {_cfg.Server} / {_cfg.Database}");
+        sb.AppendLine($"-- Script mode: {ScriptModeText.Label(effective)}");
+        sb.AppendLine($"-- Data:        {DataLoadModeText.Label(dataMode)}");
+        sb.AppendLine($"-- Generated:   {DateTime.Now:yyyy-MM-dd HH:mm}");
+        sb.AppendLine("-- ============================================================================");
+        sb.AppendLine();
+
+        foreach (var phase in manifest.Phases)
+        {
+            sb.AppendLine($"-- ═══ Phase {phase.Phase}: {phase.Name} ═══");
+            sb.AppendLine();
+            foreach (var entry in phase.Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                progress.Report(new InstallProgress(entry, InstallStatus.Running));
+
+                if (entry.Type == ObjectTypes.Data)
+                {
+                    sb.AppendLine($"-- DATA {entry.Object}: {entry.File} ({entry.Rows:N0} rows) - loaded with \"{DataLoadModeText.Label(dataMode)}\"");
+                }
+                else
+                {
+                    sb.AppendLine($"-- ─── {entry.File} ───");
+                    sb.AppendLine((await ReadScriptAsync(Path.Combine(folder, entry.File.Replace('/', Path.DirectorySeparatorChar)), ct)).TrimEnd());
+                    sb.AppendLine();
+                }
+                progress.Report(new InstallProgress(entry, InstallStatus.Done));
+            }
+            sb.AppendLine();
+        }
+
+        var path = Path.Combine(folder, PreviewFileName);
+        await File.WriteAllTextAsync(path, sb.ToString(), ct);
+        return path;
+    }
+
     public async Task RunAsync(
         string                     folder,
         InstallManifest            manifest,
         IProgress<InstallProgress> progress,
-        CancellationToken          ct)
+        CancellationToken          ct,
+        ScriptMode?                mode     = null,
+        DataLoadMode               dataMode = DataLoadMode.SkipIfNotEmpty)
     {
         var logger = new ErrorLogger(folder);
+        var loader = new DataLoader(_cfg, dataMode);
+
+        // A mode other than the one the backup was written with: scripts are
+        // re-wrapped in memory before running; the backup files stay as they are.
+        _rewrapTo = mode is { } m && m != ManifestMode(manifest) ? m : null;
+
+        void Report(ManifestEntry entry, List<string> warnings)
+        {
+            if (warnings.Count == 0)
+            {
+                progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                return;
+            }
+            logger.LogWarnings(entry, warnings);
+            var more = warnings.Count > 1 ? $" (+{warnings.Count - 1} more, see error.log)" : "";
+            progress.Report(new InstallProgress(entry, InstallStatus.Warning, warnings[0] + more));
+        }
 
         foreach (var phase in manifest.Phases)
         {
-            foreach (var entry in phase.Files)
+            var dataEntries = phase.Files.Where(f => f.Type == ObjectTypes.Data).ToList();
+            if (dataEntries.Count > 0)
+                await loader.BeginPhaseAsync(dataEntries.Select(f => f.Object), ct);
+
+            try
             {
-                ct.ThrowIfCancellationRequested();
-
-                progress.Report(new InstallProgress(entry, InstallStatus.Running));
-                try
+                foreach (var entry in phase.Files)
                 {
-                    var fullPath = Path.Combine(folder,
-                        entry.File.Replace('/', Path.DirectorySeparatorChar));
+                    ct.ThrowIfCancellationRequested();
 
-                    if (entry.Type == ObjectTypes.Data)
-                        await InsertDataFileAsync(fullPath, ct);
-                    else
-                        await ExecuteSqlFileAsync(fullPath, ct);
+                    progress.Report(new InstallProgress(entry, InstallStatus.Running));
+                    try
+                    {
+                        var fullPath = Path.Combine(folder,
+                            entry.File.Replace('/', Path.DirectorySeparatorChar));
 
-                    progress.Report(new InstallProgress(entry, InstallStatus.Done));
+                        Report(entry, entry.Type == ObjectTypes.Data
+                            ? await loader.LoadChunkAsync(fullPath, ct)
+                            : await ExecuteSqlFileAsync(fullPath, ct));
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        logger.Log(entry, ex);
+                        progress.Report(new InstallProgress(entry, InstallStatus.Error, ex.Message));
+                    }
                 }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
+            }
+            finally
+            {
+                // Foreign keys and triggers switched off for the load come back on,
+                // even after a cancel; problems are reported on the last data file.
+                if (dataEntries.Count > 0)
                 {
-                    logger.Log(entry, ex);
-                    progress.Report(new InstallProgress(entry, InstallStatus.Error, ex.Message));
+                    var problems = await loader.EndPhaseAsync();
+                    if (problems.Count > 0)
+                        Report(dataEntries[^1], problems);
                 }
             }
         }
@@ -54,9 +155,16 @@ public class InstallService
         logger.WriteSummary();
     }
 
-    private async Task ExecuteSqlFileAsync(string filePath, CancellationToken ct)
+    /// <summary>The script mode a backup was written with (DropAndCreate for v1 backups).</summary>
+    public static ScriptMode ManifestMode(InstallManifest manifest) =>
+        Enum.TryParse<ScriptMode>(manifest.ScriptMode, ignoreCase: true, out var m) ? m : ScriptMode.DropAndCreate;
+
+    private ScriptMode? _rewrapTo;
+
+    /// <summary>Runs a script; returns the warnings it raised (RAISERROR severity <= 10).</summary>
+    private async Task<List<string>> ExecuteSqlFileAsync(string filePath, CancellationToken ct)
     {
-        var content = await File.ReadAllTextAsync(filePath, ct);
+        var content = await ReadScriptAsync(filePath, ct);
 
         // Split on GO batch separator (SQL Server Management Studio directive)
         var batches = content.Split(
@@ -64,6 +172,15 @@ public class InstallService
             StringSplitOptions.RemoveEmptyEntries);
 
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        // Informational RAISERRORs from generated scripts (number 50000) are warnings,
+        // e.g. CreateOrAlter column differences. Server chatter has other numbers.
+        var warnings = new List<string>();
+        conn.InfoMessage += (_, e) =>
+        {
+            foreach (SqlError err in e.Errors)
+                if (err.Number == 50000) warnings.Add(err.Message);
+        };
 
         // Files such as indexes.sql hold many independent objects: a failing batch
         // must not stop the rest. Errors are collected and reported together.
@@ -95,190 +212,8 @@ public class InstallService
         if (errors.Count > 1)
             throw new InvalidOperationException(
                 $"{errors.Count} of {executed} statements failed: " + string.Join(" | ", errors));
-    }
 
-    private async Task InsertDataFileAsync(string filePath, CancellationToken ct)
-    {
-        var json  = await File.ReadAllTextAsync(filePath, ct);
-        var chunk = JsonSerializer.Deserialize<DataChunk>(json, _jsonOptions);
-        if (chunk is null || chunk.Rows.Count == 0) return;
-
-        var schemaParts = chunk.Table.Split('.', 2);
-        var schema      = schemaParts.Length == 2 ? schemaParts[0] : "dbo";
-        var table       = schemaParts.Length == 2 ? schemaParts[1] : schemaParts[0];
-
-        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
-
-        var hasIdentity = await HasIdentityColumnAsync(conn, schema, table, ct);
-        var colTypes    = await GetColumnTypesAsync(conn, schema, table, chunk.Columns, ct);
-
-        var colList   = string.Join(", ", chunk.Columns.Select(c => $"[{c}]"));
-        var paramList = string.Join(", ", chunk.Columns.Select((_, i) => $"@p{i}"));
-        var insertSql = $"INSERT INTO [{schema}].[{table}] ({colList}) VALUES ({paramList})";
-
-        await using var tran = conn.BeginTransaction();
-        try
-        {
-            if (hasIdentity)
-            {
-                await using var onCmd = new SqlCommand(
-                    $"SET IDENTITY_INSERT [{schema}].[{table}] ON", conn, tran);
-                await onCmd.ExecuteNonQueryAsync(ct);
-            }
-
-            await using var cmd = new SqlCommand(insertSql, conn, tran);
-            for (int i = 0; i < chunk.Columns.Count; i++)
-            {
-                var p = new SqlParameter($"@p{i}", DBNull.Value);
-                ConfigureParameterType(p, i < colTypes.Count ? colTypes[i] : null);
-                cmd.Parameters.Add(p);
-            }
-
-            foreach (var row in chunk.Rows)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                for (int i = 0; i < chunk.Columns.Count; i++)
-                {
-                    var raw     = i < row.Length ? row[i] : null;
-                    var sqlType = i < colTypes.Count ? colTypes[i] : null;
-                    var val     = raw is JsonElement je
-                        ? ConvertJsonElement(je, sqlType)
-                        : raw;
-                    cmd.Parameters[$"@p{i}"].Value = val ?? (object)DBNull.Value;
-                }
-                await cmd.ExecuteNonQueryAsync(ct);
-            }
-
-            if (hasIdentity)
-            {
-                await using var offCmd = new SqlCommand(
-                    $"SET IDENTITY_INSERT [{schema}].[{table}] OFF", conn, tran);
-                await offCmd.ExecuteNonQueryAsync(ct);
-            }
-
-            await tran.CommitAsync(ct);
-        }
-        catch
-        {
-            await tran.RollbackAsync(CancellationToken.None);
-            throw;
-        }
-    }
-
-    private static async Task<bool> HasIdentityColumnAsync(
-        SqlConnection conn, string schema, string table, CancellationToken ct)
-    {
-        const string sql = @"
-            SELECT COUNT(*) FROM sys.columns
-            WHERE object_id = OBJECT_ID(@fqn) AND is_identity = 1";
-
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return Convert.ToInt32(result) > 0;
-    }
-
-    private static async Task<List<string?>> GetColumnTypesAsync(
-        SqlConnection conn, string schema, string table,
-        List<string> columns, CancellationToken ct)
-    {
-        const string sql = @"
-            SELECT c.name, t.name
-            FROM sys.columns c
-            JOIN sys.types t ON c.user_type_id = t.user_type_id
-            WHERE c.object_id = OBJECT_ID(@fqn)";
-
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 30 };
-        cmd.Parameters.AddWithValue("@fqn", $"{schema}.{table}");
-
-        var typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        await using var rdr = await cmd.ExecuteReaderAsync(ct);
-        while (await rdr.ReadAsync())
-            typeMap[rdr.GetString(0)] = rdr.GetString(1).ToUpper();
-
-        return columns.Select(c => typeMap.TryGetValue(c, out var t) ? t : (string?)null).ToList();
-    }
-
-    /// <summary>
-    /// Fixes the parameter type where inferring it from the .NET value loses data:
-    /// a DateTime would be sent as legacy DATETIME (~3 ms precision, rounding
-    /// datetime2 values), and an untyped NULL as nvarchar, which SQL Server will
-    /// not convert implicitly to a binary column.
-    /// </summary>
-    private static void ConfigureParameterType(SqlParameter p, string? sqlType)
-    {
-        switch (sqlType)
-        {
-            case "DATETIME2":
-                p.SqlDbType = System.Data.SqlDbType.DateTime2;
-                p.Scale     = 7;
-                break;
-            case "DATE":
-                p.SqlDbType = System.Data.SqlDbType.Date;
-                break;
-            case "TIME":
-                p.SqlDbType = System.Data.SqlDbType.Time;
-                p.Scale     = 7;
-                break;
-            case "DATETIMEOFFSET":
-                p.SqlDbType = System.Data.SqlDbType.DateTimeOffset;
-                p.Scale     = 7;
-                break;
-            case "BINARY" or "VARBINARY" or "IMAGE":
-                p.SqlDbType = System.Data.SqlDbType.VarBinary;
-                p.Size      = -1;
-                break;
-        }
-    }
-
-    private static object? ConvertJsonElement(JsonElement el, string? sqlType = null)
-    {
-        return el.ValueKind switch
-        {
-            JsonValueKind.Null    => null,
-            JsonValueKind.True    => true,
-            JsonValueKind.False   => false,
-            // Prefer decimal over double so DECIMAL/NUMERIC/MONEY keep every digit;
-            // only FLOAT/REAL columns (and values too large for decimal) use double.
-            JsonValueKind.Number  => el.TryGetInt64(out var l)                    ? l
-                                   : sqlType is "FLOAT" or "REAL"                 ? el.GetDouble()
-                                   : el.TryGetDecimal(out var m)                  ? m
-                                   : (object?)el.GetDouble(),
-            JsonValueKind.String  => ConvertStringValue(el.GetString(), sqlType),
-            _                     => el.ToString()
-        };
-    }
-
-    private static object? ConvertStringValue(string? s, string? sqlType)
-    {
-        if (s is null) return null;
-
-        switch (sqlType)
-        {
-            case "IMAGE" or "VARBINARY" or "BINARY" or "TIMESTAMP" or "ROWVERSION":
-                try { return Convert.FromBase64String(s); }
-                catch { return s; }
-
-            case "DATETIME" or "DATETIME2" or "SMALLDATETIME" or "DATE":
-                if (DateTime.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var dt))
-                    return dt;
-                break;
-
-            case "DATETIMEOFFSET":
-                if (DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var dto))
-                    return dto;
-                break;
-
-            case "TIME":
-                if (TimeSpan.TryParse(s, out var ts))
-                    return ts;
-                break;
-        }
-
-        return s;
+        return warnings;
     }
 
     public static InstallManifest LoadManifest(string folder)

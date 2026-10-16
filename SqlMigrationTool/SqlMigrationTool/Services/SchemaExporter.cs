@@ -250,6 +250,118 @@ public class SchemaExporter
         return count == 0 ? null : sb.ToString();
     }
 
+    /// <summary>
+    /// CREATE TYPE ... AS TABLE for every user-defined table type, with its columns,
+    /// PRIMARY KEY / UNIQUE / CHECK constraints and inline indexes; null when there are none.
+    /// Constraint names are omitted because table types do not allow them.
+    /// </summary>
+    public async Task<string?> ScriptTableTypesAsync()
+    {
+        const string typesSql = @"
+            SELECT SCHEMA_NAME(tt.schema_id), tt.name, tt.type_table_object_id, tt.is_memory_optimized
+            FROM sys.table_types tt
+            WHERE tt.is_user_defined = 1
+            ORDER BY 1, 2";
+
+        await using var conn = await SqlConnectionService.OpenAsync(_cfg);
+
+        var types = new List<(string schema, string name, int objectId, bool memoryOptimized)>();
+        await using (var cmd = new SqlCommand(typesSql, conn))
+        await using (var rdr = await cmd.ExecuteReaderAsync())
+            while (await rdr.ReadAsync())
+                types.Add((rdr.GetString(0), rdr.GetString(1), rdr.GetInt32(2), rdr.GetBoolean(3)));
+
+        if (types.Count == 0) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("-- User-Defined Table Types");
+        sb.AppendLine();
+
+        foreach (var (schema, name, objectId, memoryOptimized) in types)
+        {
+            var lines = await GetColumnDefsAsync(conn, objectId, forTableType: true);
+            lines.AddRange(await GetTableTypeConstraintsAsync(conn, objectId));
+
+            var fullName = SqlNames.Quote(schema, name);
+            sb.AppendLine($"IF TYPE_ID({SqlNames.Literal(fullName)}) IS NULL");
+            sb.AppendLine($"    CREATE TYPE {fullName} AS TABLE (");
+            sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"        {l}")));
+            sb.AppendLine(memoryOptimized ? "    ) WITH (MEMORY_OPTIMIZED = ON);" : "    );");
+            sb.AppendLine("GO");
+        }
+        return sb.ToString();
+    }
+
+    private static async Task<List<string>> GetTableTypeConstraintsAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT 'K' AS Kind, i.index_id, i.name, i.type_desc, i.is_unique,
+                   i.is_primary_key, NULL AS Definition
+            FROM sys.indexes i
+            WHERE i.object_id = @id AND i.type > 0
+            UNION ALL
+            SELECT 'C', NULL, NULL, NULL, NULL, NULL, cc.definition
+            FROM sys.check_constraints cc
+            WHERE cc.parent_object_id = @id
+            ORDER BY Kind DESC, index_id";
+
+        var keyColumns = await GetIndexKeyColumnsAsync(conn, objectId);
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var lines = new List<string>();
+        while (await rdr.ReadAsync())
+        {
+            if (rdr.GetString(0) == "C")
+            {
+                lines.Add($"CHECK {rdr.GetString(6)}");
+                continue;
+            }
+
+            var cols      = keyColumns[rdr.GetInt32(1)];
+            var clustered = rdr.GetString(3);              // CLUSTERED / NONCLUSTERED / HASH ...
+            var unique    = rdr.GetBoolean(4);
+
+            if (rdr.GetBoolean(5))
+                lines.Add($"PRIMARY KEY {clustered} ({cols})");
+            else if (rdr.IsDBNull(2) || unique && IsSystemIndexName(rdr.GetString(2)))
+                lines.Add($"UNIQUE {clustered} ({cols})"); // inline UNIQUE constraint
+            else
+                lines.Add($"INDEX {SqlNames.Quote(rdr.GetString(2))}{(unique ? " UNIQUE" : "")} {clustered} ({cols})");
+        }
+        return lines;
+    }
+
+    // System-generated constraint index names look like UQ__IdList__3214EC27A1B2C3D4.
+    private static bool IsSystemIndexName(string name) =>
+        System.Text.RegularExpressions.Regex.IsMatch(name, @"^(UQ|PK)__.+__[0-9A-F]{16}$");
+
+    /// <summary>Key column list per index_id, e.g. "[A], [B] DESC".</summary>
+    private static async Task<Dictionary<int, string>> GetIndexKeyColumnsAsync(SqlConnection conn, int objectId)
+    {
+        const string sql = @"
+            SELECT ic.index_id, c.name, ic.is_descending_key
+            FROM sys.index_columns ic
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = @id AND ic.key_ordinal > 0
+            ORDER BY ic.index_id, ic.key_ordinal";
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id", objectId);
+        await using var rdr = await cmd.ExecuteReaderAsync();
+
+        var cols = new Dictionary<int, List<string>>();
+        while (await rdr.ReadAsync())
+        {
+            var indexId = rdr.GetInt32(0);
+            if (!cols.TryGetValue(indexId, out var list)) cols[indexId] = list = new();
+            list.Add(SqlNames.Quote(rdr.GetString(1)) + (rdr.GetBoolean(2) ? " DESC" : ""));
+        }
+        return cols.ToDictionary(kv => kv.Key, kv => string.Join(", ", kv.Value));
+    }
+
     public async Task<string> ScriptForeignKeysAsync()
     {
         const string sql = @"

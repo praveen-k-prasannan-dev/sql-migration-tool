@@ -29,8 +29,9 @@ public sealed class DbSnapshot
         """;
 
     // True when the object_id belongs to a user table or user table type.
+    // Table-type objects are always flagged is_ms_shipped = 1, so they are not filtered on it.
     private static string IsUserParent(string id) =>
-        $"EXISTS (SELECT 1 FROM sys.objects p_ WHERE p_.object_id = {id} AND p_.type IN ('U','TT') AND p_.is_ms_shipped = 0)";
+        $"EXISTS (SELECT 1 FROM sys.objects p_ WHERE p_.object_id = {id} AND (p_.type = 'TT' OR p_.type = 'U' AND p_.is_ms_shipped = 0))";
 
     private static string IndexColumns(string objId, string idxId, bool included) => $"""
         ISNULL(STUFF((

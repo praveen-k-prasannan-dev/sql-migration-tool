@@ -168,7 +168,8 @@ public class frmSplash : Form
         using (var f  = new Font("Segoe UI", 7.5f))
         using (var br = new SolidBrush(Color.FromArgb(72, 76, 105)))
         {
-            const string t = "Version 1.0.0";
+            // From <Version> in the project file, so it cannot drift from the package version.
+            var t = $"Version {typeof(frmSplash).Assembly.GetName().Version!.ToString(3)}";
             var sz = g.MeasureString(t, f);
             g.DrawString(t, f, br, W - sz.Width - 14, H - 22f);
         }

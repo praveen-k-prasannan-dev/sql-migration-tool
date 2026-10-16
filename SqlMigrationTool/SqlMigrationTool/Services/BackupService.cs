@@ -38,7 +38,8 @@ public class BackupService
             SourceServer          = _cfg.Server,
             SourceDatabase        = _cfg.Database,
             SqlCompatibilityLevel = await _schema.GetCompatibilityLevelAsync(),
-            DatabaseCollation     = await _schema.GetDatabaseCollationAsync()
+            DatabaseCollation     = await _schema.GetDatabaseCollationAsync(),
+            ScriptMode            = mode.ToString()
         };
 
         _order = 1;
@@ -267,7 +268,7 @@ public class BackupService
 
     private Task<string> ScriptObjectAsync(DatabaseObject obj) => obj.Type switch
     {
-        ObjectTypes.Table => _schema.ScriptTableAsync(obj),
+        ObjectTypes.Table => _schema.ScriptTableAsync(obj, _mode),
         ObjectTypes.View or ObjectTypes.Func or ObjectTypes.Proc
                           => _schema.ScriptModuleAsync(obj, _mode),
         _ => throw new NotSupportedException($"No scripter for object type {obj.Type}")

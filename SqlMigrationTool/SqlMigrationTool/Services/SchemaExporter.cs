@@ -105,33 +105,31 @@ public class SchemaExporter
 
     // ── Script generation ───────────────────────────────────────────────────
 
-    public async Task<string> ScriptTableAsync(DatabaseObject tbl)
+    /// <summary>CREATE TABLE with columns, keys and CHECK constraints, wrapped for <paramref name="mode"/>.</summary>
+    public async Task<string> ScriptTableAsync(DatabaseObject tbl, ScriptMode mode)
     {
         await using var conn = await SqlConnectionService.OpenAsync(_cfg);
 
         var objectId = await GetObjectIdAsync(conn, tbl.Schema, tbl.Name);
-        var lines    = await GetColumnDefsAsync(conn, objectId, forTableType: false);
-        var (constraints, disabledChecks) = await GetTableConstraintsAsync(conn, objectId);
-        lines.AddRange(constraints);
+        var columns  = await GetColumnDefsAsync(conn, objectId, forTableType: false);
+        var (constraints, uncheckedChecks) = await GetTableConstraintsAsync(conn, objectId);
         var placement = await GetTablePlacementAsync(conn, objectId);
 
-        var name = SqlNames.Quote(tbl.Schema, tbl.Name);
-        var sb = new StringBuilder();
-        sb.AppendLine($"-- Table: {tbl.FullName}");
-        sb.AppendLine($"IF OBJECT_ID({SqlNames.Literal(name)},'U') IS NOT NULL");
-        sb.AppendLine($"    DROP TABLE {name}");
-        sb.AppendLine("GO");
-        sb.AppendLine($"CREATE TABLE {name} (");
-        sb.AppendLine(string.Join(",\r\n", lines.Select(l => $"    {l}")));
-        sb.AppendLine(")" + placement);
-        sb.AppendLine("GO");
+        var lines = columns.Select(c => c.Definition).Concat(constraints);
+        var body  = $"CREATE TABLE {SqlNames.Quote(tbl.Schema, tbl.Name)} (\r\n" +
+                    string.Join(",\r\n", lines.Select(l => $"    {l}")) +
+                    $"\r\n){placement}";
 
-        foreach (var check in disabledChecks)
+        var info = new ScriptObjectInfo
         {
-            sb.AppendLine($"ALTER TABLE {name} NOCHECK CONSTRAINT {SqlNames.Quote(check)}");
-            sb.AppendLine("GO");
-        }
-        return sb.ToString();
+            Type            = ObjectTypes.Table,
+            Schema          = tbl.Schema,
+            Name            = tbl.Name,
+            SysType         = "U",
+            Columns         = columns,
+            UncheckedChecks = uncheckedChecks.Count > 0 ? uncheckedChecks : null
+        };
+        return ScriptWrapper.Wrap(info, body, mode);
     }
 
     /// <summary>
@@ -168,7 +166,7 @@ public class SchemaExporter
             ParentSysType = rdr.IsDBNull(4) ? null : rdr.GetString(4).Trim(),
             Disabled      = rdr.GetBoolean(5)
         };
-        return ScriptWrapper.WrapModule(info, rdr.GetString(1), mode);
+        return ScriptWrapper.Wrap(info, rdr.GetString(1), mode);
     }
 
     // ── Prerequisites ───────────────────────────────────────────────────────
@@ -263,7 +261,7 @@ public class SchemaExporter
 
         foreach (var (schema, name, objectId, memoryOptimized) in types)
         {
-            var lines = await GetColumnDefsAsync(conn, objectId, forTableType: true);
+            var lines = (await GetColumnDefsAsync(conn, objectId, forTableType: true)).Select(c => c.Definition).ToList();
             lines.AddRange(await GetTableTypeConstraintsAsync(conn, objectId));
 
             var fullName = SqlNames.Quote(schema, name);
@@ -1020,7 +1018,7 @@ public class SchemaExporter
     /// Named defaults keep their names except inside table types, where constraint
     /// names are not allowed.
     /// </summary>
-    private static async Task<List<string>> GetColumnDefsAsync(
+    private static async Task<List<ColumnInfo>> GetColumnDefsAsync(
         SqlConnection conn, int objectId, bool forTableType)
     {
         const string sql = @"
@@ -1058,12 +1056,23 @@ public class SchemaExporter
         await using var cmd = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@id", objectId);
 
-        var defs = new List<string>();
+        var defs = new List<ColumnInfo>();
         await using var rdr = await cmd.ExecuteReaderAsync();
         while (await rdr.ReadAsync())
         {
             string? Str(string col)  => rdr[col] is DBNull ? null : (string)rdr[col];
             bool    Bool(string col) => rdr[col] is bool b && b;
+            ColumnInfo Column(string definition) => new()
+            {
+                Name       = rdr.GetString(0),
+                Definition = definition,
+                TypeName   = rdr.GetString(1),
+                MaxLength  = Convert.ToInt32(rdr["max_length"]),
+                Precision  = Convert.ToInt32(rdr["precision"]),
+                Scale      = Convert.ToInt32(rdr["scale"]),
+                Nullable   = Bool("is_nullable"),
+                Computed   = Str("ComputedDef") != null
+            };
 
             var colName = SqlNames.Quote(rdr.GetString(0));
 
@@ -1073,7 +1082,7 @@ public class SchemaExporter
                 var persisted = Bool("is_persisted")
                     ? " PERSISTED" + (Bool("is_nullable") ? "" : " NOT NULL")
                     : "";
-                defs.Add($"{colName} AS {computedDef}{persisted}");
+                defs.Add(Column($"{colName} AS {computedDef}{persisted}"));
                 continue;
             }
 
@@ -1112,7 +1121,7 @@ public class SchemaExporter
                 sb.Append($" DEFAULT {defaultDef}");
             }
 
-            defs.Add(sb.ToString());
+            defs.Add(Column(sb.ToString()));
         }
         return defs;
     }

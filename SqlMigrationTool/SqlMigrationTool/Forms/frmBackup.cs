@@ -16,6 +16,7 @@ public class frmBackup : Form
     private CheckBox        chkTriggers     = null!;
     private CheckedListBox  lstObjects      = null!;
     private NumericUpDown   nudChunkSize    = null!;
+    private ComboBox        cmbScriptMode   = null!;
     private ListBox         lstLog          = null!;
     private ListView        lstSummary      = null!;
     private Label           lblStatus       = null!;
@@ -148,6 +149,20 @@ public class frmBackup : Form
         };
         content.Controls.Add(nudChunkSize);
         content.Controls.Add(MakeLabel("(split large tables into chunks)", 210, y + 2, Color.Gray));
+
+        // Script mode: how the scripts treat objects that already exist on the target.
+        // Stored in the manifest as the default; the install screen can override it.
+        content.Controls.Add(MakeLabel("Script mode:", 470, y + 2));
+        cmbScriptMode = new ComboBox
+        {
+            Location      = new Point(560, y - 1),
+            Width         = 220,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        foreach (var mode in Enum.GetValues<ScriptMode>())
+            cmbScriptMode.Items.Add(new ModeItem(mode));
+        cmbScriptMode.SelectedIndex = 0;   // DropAndCreate: the v1 behaviour
+        content.Controls.Add(cmbScriptMode);
         y += 36;
 
         // Section headers
@@ -450,7 +465,8 @@ public class frmBackup : Form
         try
         {
             var svc = new BackupService(_cfg);
-            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token);
+            var mode = ((ModeItem)cmbScriptMode.SelectedItem!).Mode;
+            await svc.RunAsync(folder, selected, (int)nudChunkSize.Value, progress, _cts.Token, mode);
 
             MessageBox.Show(
                 $"Backup complete!\n\nOutput folder:\n{folder}",
@@ -474,5 +490,10 @@ public class frmBackup : Form
             _cts?.Dispose();
             _cts = null;
         }
+    }
+
+    private sealed record ModeItem(ScriptMode Mode)
+    {
+        public override string ToString() => ScriptModeText.Label(Mode);
     }
 }

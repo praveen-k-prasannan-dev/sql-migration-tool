@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest template. Build-Msix.ps1 replaces the $...$ tokens:
+  identity values come from StoreIdentity.json (Partner Center > Product identity),
+  the version from the project file.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="$IdentityName$"
+    Publisher="$Publisher$"
+    Version="$Version$"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>SQL Migration Tool</DisplayName>
+    <PublisherDisplayName>$PublisherDisplayName$</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Back up a SQL Server database as portable scripts and data, and restore it to any SQL Server version.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="SqlMigrationTool" Executable="SqlMigrationTool.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="SQL Migration Tool"
+        Description="Version-independent SQL Server backup and restore"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" ShortName="SQL Migration" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- A WinForms desktop app runs as full trust; it connects to SQL Server and reads/writes user-chosen folders. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

@@ -1,0 +1,6 @@
+{
+  "_comment": "Replace with the values from Partner Center > your app > Product management > Product identity before building the Store package. The placeholders below only work for local test installs.",
+  "IdentityName": "PraveenKuttatharaPrasannan.SQLMigrationTool.Dev",
+  "Publisher": "CN=SqlMigrationTool-Dev",
+  "PublisherDisplayName": "Praveen Kuttathara Prasannan"
+}

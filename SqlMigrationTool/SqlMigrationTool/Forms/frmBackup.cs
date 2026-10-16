@@ -167,7 +167,7 @@ public class frmBackup : Form
         cmbScriptMode = new ComboBox
         {
             Location      = new Point(560, y - 1),
-            Width         = 220,
+            Width         = 195,
             DropDownStyle = ComboBoxStyle.DropDownList
         };
         foreach (var mode in Enum.GetValues<ScriptMode>())
@@ -179,7 +179,7 @@ public class frmBackup : Form
         chkCleanupScript = new CheckBox
         {
             Text     = "Also write a cleanup script",
-            Location = new Point(796, y + 1),
+            Location = new Point(768, y + 1),
             AutoSize = true
         };
         content.Controls.Add(chkCleanupScript);

@@ -18,6 +18,7 @@ public sealed class Options
     public bool    KeepTarget { get; private set; }
     public bool    Cleanup    { get; private set; }
     public bool    Preview    { get; private set; }
+    public bool    ApplyCompat { get; private set; }
     public ScriptMode Mode    { get; private set; } = ScriptMode.DropAndCreate;
     public ScriptMode? InstallMode { get; private set; }
     public DataLoadMode DataMode { get; private set; } = DataLoadMode.SkipIfNotEmpty;
@@ -59,6 +60,7 @@ public sealed class Options
                 case "--keep-target": o.KeepTarget = true; break;
                 case "--cleanup":    o.Cleanup    = true; break;
                 case "--preview":    o.Preview    = true; break;
+                case "--apply-compat": o.ApplyCompat = true; break;
                 case "--mode":       o.Mode       = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--install-mode": o.InstallMode = Enum.Parse<ScriptMode>(Next(), ignoreCase: true); break;
                 case "--data-mode":  o.DataMode   = Enum.Parse<DataLoadMode>(Next(), ignoreCase: true); break;
@@ -102,6 +104,7 @@ public sealed class Options
               --folder <path>      install: backup folder containing app_install.config.json
               --keep-target        install: install over the existing target instead of recreating it
               --preview            install: write preview_install.sql only; execute nothing
+              --apply-compat       set the target to the source's compatibility level (capped by the server)
 
             Only databases named SqlMigTest_* are ever dropped or recreated.
             """);

@@ -100,6 +100,12 @@ public static class Commands
         });
         var manifest = InstallService.LoadManifest(folder);
         Out.Info($"  Manifest version {manifest.Version}");
+
+        var installer = new InstallService(o.Config(o.TargetDb));
+        foreach (var note in InstallService.DescribeDifferences(manifest, await installer.GetTargetInfoAsync()))
+            Out.Warn($"  NOTE: {note}");
+        if (o.ApplyCompat)
+            Out.Info($"  {await installer.ApplyCompatibilityLevelAsync(manifest)}");
         await new InstallService(o.Config(o.TargetDb)).RunAsync(folder, manifest, installProgress, CancellationToken.None, o.InstallMode, o.DataMode);
         return installErrors;
     }
